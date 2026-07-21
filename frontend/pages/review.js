@@ -1,25 +1,36 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { Loader2, AlertCircle, FileText, Download, CheckCircle2, AlertTriangle, Info } from 'lucide-react';
 import useSWR from 'swr';
 
-const fetcher = (url) => fetch(url).then((res) => res.json());
+import { fetcher } from '../lib/api';
+import { useCaseContext } from '../lib/case-context';
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const apiUrl = (path) => `${API_BASE_URL}${path}`;
 
 export default function Review() {
-  const [selectedCase, setSelectedCase] = useState(1);
+  const { selectedCaseId } = useCaseContext();
+  const selectedCase = selectedCaseId || 1;
   const [activeTab, setActiveTab] = useState('calculation');
+  const [applyingItrForm, setApplyingItrForm] = useState(false);
   
   const { data: calcData, isLoading: calcLoading, error: calcError } = useSWR(
-    selectedCase ? `/api/cases/${selectedCase}/reports/calculation` : null,
+    selectedCase ? apiUrl(`/api/cases/${selectedCase}/reports/calculation`) : null,
     fetcher
   );
   
   const { data: formData, isLoading: formLoading, error: formError } = useSWR(
-    selectedCase ? `/api/cases/${selectedCase}/reports/form-summary` : null,
+    selectedCase ? apiUrl(`/api/cases/${selectedCase}/reports/form-summary`) : null,
+    fetcher
+  );
+  const { data: itrData, mutate: mutateItr } = useSWR(
+    selectedCase ? apiUrl(`/api/cases/${selectedCase}/itr-form-recommendation`) : null,
     fetcher
   );
 
   const calcReport = calcData?.report || {};
   const formReport = formData?.report || {};
+  const itrRecommendation = itrData?.recommendation || null;
 
   const handleExportPDF = () => {
     alert('PDF export functionality coming soon. For now, use browser print to PDF.');
@@ -38,12 +49,26 @@ export default function Review() {
   const isLoading = (activeTab === 'calculation' && calcLoading) || (activeTab === 'form' && formLoading);
   const error = (activeTab === 'calculation' && calcError) || (activeTab === 'form' && formError);
 
+  const applyRecommendedForm = async () => {
+    setApplyingItrForm(true);
+    try {
+      await fetch(apiUrl(`/api/cases/${selectedCase}/itr-form-recommendation/apply`), { method: 'POST' });
+      await mutateItr();
+    } finally {
+      setApplyingItrForm(false);
+    }
+  };
+
   return (
     <div className="space-y-8">
       {/* Header */}
       <div>
         <h1 className="text-4xl font-bold text-gray-900 mb-2">📋 Final Review & Report</h1>
         <p className="text-lg text-gray-600">Generate detailed tax reports before filing on the official portal</p>
+      </div>
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm text-blue-900">
+        Final sequence: <a className="underline font-semibold" href="/reconciliation">Reconciliation</a> → review blockers/warnings here →
+        confirm ITR form recommendation → <a className="underline font-semibold" href="/export">Export</a> for portal/offline utility filing.
       </div>
 
       {/* Tabs & Export */}
@@ -70,6 +95,33 @@ export default function Review() {
             📝 Form Summary
           </button>
         </div>
+
+        {itrRecommendation && (
+          <div className="card p-5 border border-primary-200 bg-primary-50">
+            <div className="flex items-center justify-between gap-4 flex-wrap">
+              <div>
+                <p className="text-sm text-primary-700 font-medium">ITR Form Recommendation</p>
+                <p className="text-lg font-bold text-primary-900 mt-1">
+                  Recommended: {itrRecommendation.recommended_form} • Current: {itrRecommendation.current_form}
+                </p>
+                <p className="text-sm text-primary-800 mt-1">{itrRecommendation.reason}</p>
+                <p className="text-xs text-primary-700 mt-1">
+                  Auto-refreshes from latest profile, residency status, income heads, property and document signals.
+                </p>
+              </div>
+              {itrRecommendation.recommended_form !== itrRecommendation.current_form && (
+                <button
+                  onClick={applyRecommendedForm}
+                  disabled={applyingItrForm}
+                  className="inline-flex items-center gap-2 rounded-lg bg-primary-600 text-white px-4 py-2 hover:bg-primary-700 disabled:bg-gray-400"
+                >
+                  {applyingItrForm ? <Loader2 className="w-4 h-4 animate-spin" /> : null}
+                  Use Recommended Form
+                </button>
+              )}
+            </div>
+          </div>
+        )}
 
         <div className="flex gap-2">
           <button

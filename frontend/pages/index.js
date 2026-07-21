@@ -1,196 +1,124 @@
 import Link from 'next/link';
-import { FileText, Users, MessageSquare, Zap, CheckCircle2, TrendingUp } from 'lucide-react';
+import { ArrowRight, FileText, CheckCircle, BarChart3, MessageSquare } from 'lucide-react';
 
 export default function Home() {
-  const features = [
-    {
-      icon: FileText,
-      title: 'Smart Document Fetcher',
-      description: 'Find where to get all required ITR documents. Official portal links + step-by-step instructions.',
-      href: '/documents',
-      color: 'from-blue-500 to-cyan-500',
-    },
-    {
-      icon: Users,
-      title: 'Household Profile',
-      description: 'Manage family information, residency status, dependent details for accurate tax filing.',
-      href: '/profile',
-      color: 'from-purple-500 to-pink-500',
-    },
-    {
-      icon: MessageSquare,
-      title: 'AI Tax Assistant',
-      description: 'Ask questions about deductions, residency rules, tax savings. Get instant guidance.',
-      href: '/chat',
-      color: 'from-green-500 to-emerald-500',
-    },
-    {
-      icon: TrendingUp,
-      title: 'Tax Optimization',
-      description: 'Compare old vs new regime, identify deduction opportunities, maximize tax savings.',
-      href: '/#',
-      color: 'from-orange-500 to-red-500',
-    },
-  ];
-
-  const steps = [
-    { step: 1, title: 'Complete Profile', desc: 'Enter personal & family details' },
-    { step: 2, title: 'Fetch Documents', desc: 'Download from official sources' },
-    { step: 3, title: 'Upload & Process', desc: 'Upload documents to your case' },
-    { step: 4, title: 'Get Guidance', desc: 'AI assistant helps with deductions' },
-    { step: 5, title: 'Reconcile', desc: 'Match AIS / 26AS with your entries' },
-    { step: 6, title: 'File & Export', desc: 'Generate & download final report' },
-  ];
-
   return (
     <div className="space-y-12">
       {/* Hero Section */}
       <section className="text-center py-12">
         <h1 className="text-5xl md:text-6xl font-bold bg-gradient-to-r from-primary-600 to-blue-600 bg-clip-text text-transparent mb-6">
-          Professional ITR Filing Assistant
+          Professional ITR Filing
         </h1>
         <p className="text-xl text-gray-600 mb-8 max-w-2xl mx-auto">
-          Intelligent income tax return preparation for Nilesh (NRI) & Avani (RNOR)
+          Intelligent income tax return preparation for Nilesh (NRI) & Avani (RNOR) with AI-powered assistance
         </p>
         <div className="flex gap-4 justify-center flex-wrap">
-          <Link href="/documents">
-            <button className="btn-primary text-lg px-8 py-3">
-              Get Started →
+          <Link href="/dashboard">
+            <button className="flex items-center gap-2 px-8 py-3 bg-primary-600 text-white rounded-lg hover:bg-primary-700 font-semibold text-lg">
+              Get Started <ArrowRight className="w-5 h-5" />
             </button>
           </Link>
-          <Link href="/chat">
-            <button className="btn-secondary text-lg px-8 py-3">
-              Ask AI Assistant
+          <Link href="/document-fetcher">
+            <button className="flex items-center gap-2 px-8 py-3 bg-gray-200 text-gray-900 rounded-lg hover:bg-gray-300 font-semibold text-lg">
+              Download Documents <FileText className="w-5 h-5" />
             </button>
           </Link>
         </div>
       </section>
 
-      {/* Quick Stats */}
-      <section className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div className="card p-6">
-          <div className="text-4xl font-bold text-primary-600 mb-2">2</div>
-          <p className="text-gray-600">Taxpayers Registered</p>
-          <p className="text-sm text-gray-400 mt-2">Nilesh (NRI) & Avani (RNOR)</p>
+      {/* Features */}
+      <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <FileText className="w-8 h-8 text-blue-600 mb-3" />
+          <h3 className="font-semibold text-gray-900 mb-2">Smart Document Fetcher</h3>
+          <p className="text-sm text-gray-600">Find all required ITR documents with official portal links and step-by-step instructions</p>
         </div>
-        <div className="card p-6">
-          <div className="text-4xl font-bold text-success-500 mb-2">15+</div>
-          <p className="text-gray-600">Documents Tracked</p>
-          <p className="text-sm text-gray-400 mt-2">AIS, 26AS, bank, investments</p>
+
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <CheckCircle className="w-8 h-8 text-green-600 mb-3" />
+          <h3 className="font-semibold text-gray-900 mb-2">Document Tracking</h3>
+          <p className="text-sm text-gray-600">Upload and track all required documents with verification status</p>
         </div>
-        <div className="card p-6">
-          <div className="text-4xl font-bold text-blue-600 mb-2">7+</div>
-          <p className="text-gray-600">AI Tax Strategies</p>
-          <p className="text-sm text-gray-400 mt-2">80C, 80D, 24(b), and more</p>
+
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <BarChart3 className="w-8 h-8 text-purple-600 mb-3" />
+          <h3 className="font-semibold text-gray-900 mb-2">Tax Calculations</h3>
+          <p className="text-sm text-gray-600">Compare old vs new regime and identify deduction opportunities</p>
+        </div>
+
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <MessageSquare className="w-8 h-8 text-orange-600 mb-3" />
+          <h3 className="font-semibold text-gray-900 mb-2">AI Tax Assistant</h3>
+          <p className="text-sm text-gray-600">Get instant guidance on deductions, residency rules, and tax savings</p>
         </div>
       </section>
 
-      {/* Feature Cards */}
-      <section>
-        <h2 className="text-3xl font-bold text-gray-900 mb-8">Core Features</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
-          {features.map((feature, idx) => {
-            const Icon = feature.icon;
-            return (
-              <Link href={feature.href} key={idx}>
-                <div className="card p-6 hover:shadow-lg cursor-pointer group">
-                  <div className={`inline-flex p-3 rounded-lg bg-gradient-to-br ${feature.color} text-white mb-4 group-hover:scale-110 transition`}>
-                    <Icon className="w-6 h-6" />
-                  </div>
-                  <h3 className="font-bold text-gray-900 mb-2">{feature.title}</h3>
-                  <p className="text-sm text-gray-600">{feature.description}</p>
-                  <div className="text-primary-600 text-sm font-medium mt-4">Learn more →</div>
-                </div>
-              </Link>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* Quick Start Steps */}
-      <section>
-        <h2 className="text-3xl font-bold text-gray-900 mb-8">Getting Started in 6 Steps</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-          {steps.map((item, idx) => (
-            <div key={idx} className="card p-6">
-              <div className="flex items-start gap-4">
-                <div className="flex-shrink-0 w-12 h-12 bg-primary-100 text-primary-600 rounded-lg flex items-center justify-center font-bold text-lg">
-                  {item.step}
-                </div>
-                <div>
-                  <h3 className="font-bold text-gray-900">{item.title}</h3>
-                  <p className="text-sm text-gray-600 mt-1">{item.desc}</p>
-                </div>
+      {/* Filing Workflow */}
+      <section className="bg-white rounded-lg border border-gray-200 p-8">
+        <h2 className="text-2xl font-bold text-gray-900 mb-6">Filing Workflow</h2>
+        <div className="grid grid-cols-1 md:grid-cols-6 gap-4">
+          {[
+            { step: 1, title: 'Profile', desc: 'Personal details' },
+            { step: 2, title: 'Residency', desc: 'NRI/RNOR status' },
+            { step: 3, title: 'Documents', desc: 'Upload & verify' },
+            { step: 4, title: 'Income', desc: 'Enter all sources' },
+            { step: 5, title: 'Reconcile', desc: 'Cross-verify data' },
+            { step: 6, title: 'Export', desc: 'File return' },
+          ].map((item, idx) => (
+            <div key={idx} className="text-center">
+              <div className="w-12 h-12 rounded-full bg-primary-100 text-primary-600 font-bold text-lg flex items-center justify-center mx-auto mb-2">
+                {item.step}
               </div>
+              <p className="font-semibold text-gray-900">{item.title}</p>
+              <p className="text-xs text-gray-600">{item.desc}</p>
             </div>
           ))}
         </div>
       </section>
 
-      {/* Key Highlights */}
-      <section className="bg-gradient-to-r from-primary-600 to-blue-600 rounded-2xl p-8 md:p-12 text-white">
-        <h2 className="text-3xl font-bold mb-8">Why Use This Assistant?</h2>
-        <div className="grid md:grid-cols-2 gap-8">
-          <div className="space-y-4">
-            <div className="flex gap-3">
-              <CheckCircle2 className="w-6 h-6 flex-shrink-0" />
-              <div>
-                <h3 className="font-bold">Personalized for NRI & RNOR</h3>
-                <p className="text-sm text-blue-100">Specific rules for non-resident & residency status</p>
-              </div>
-            </div>
-            <div className="flex gap-3">
-              <CheckCircle2 className="w-6 h-6 flex-shrink-0" />
-              <div>
-                <h3 className="font-bold">AI-Powered Guidance</h3>
-                <p className="text-sm text-blue-100">Real-time deduction suggestions & tax planning</p>
-              </div>
-            </div>
-            <div className="flex gap-3">
-              <CheckCircle2 className="w-6 h-6 flex-shrink-0" />
-              <div>
-                <h3 className="font-bold">Document Management</h3>
-                <p className="text-sm text-blue-100">Centralized tracking of all required documents</p>
-              </div>
+      {/* Taxpayers */}
+      <section className="bg-gradient-to-r from-primary-50 to-blue-50 rounded-lg border border-primary-200 p-8">
+        <h2 className="text-2xl font-bold text-gray-900 mb-6">Taxpayers</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <div className="bg-white rounded-lg p-6 border border-primary-100">
+            <p className="text-lg font-semibold text-gray-900">Nilesh Kumar</p>
+            <p className="text-primary-600 font-medium">NRI (Non-Resident Indian)</p>
+            <p className="text-sm text-gray-600 mt-2">AY 2026-27 | FY 2025-26</p>
+            <div className="mt-3 space-y-1 text-sm text-gray-600">
+              <p>• Foreign income (salary)</p>
+              <p>• NRE & NRO accounts</p>
+              <p>• Zerodha investments</p>
             </div>
           </div>
-          <div className="space-y-4">
-            <div className="flex gap-3">
-              <CheckCircle2 className="w-6 h-6 flex-shrink-0" />
-              <div>
-                <h3 className="font-bold">Compliance & Accuracy</h3>
-                <p className="text-sm text-blue-100">Latest tax rules & 2026-27 compliance</p>
-              </div>
-            </div>
-            <div className="flex gap-3">
-              <CheckCircle2 className="w-6 h-6 flex-shrink-0" />
-              <div>
-                <h3 className="font-bold">Multi-Year History</h3>
-                <p className="text-sm text-blue-100">Track income & deductions year over year</p>
-              </div>
-            </div>
-            <div className="flex gap-3">
-              <CheckCircle2 className="w-6 h-6 flex-shrink-0" />
-              <div>
-                <h3 className="font-bold">Privacy First</h3>
-                <p className="text-sm text-blue-100">Documents stored locally, no cloud sharing</p>
-              </div>
+
+          <div className="bg-white rounded-lg p-6 border border-green-100">
+            <p className="text-lg font-semibold text-gray-900">Avani</p>
+            <p className="text-green-600 font-medium">RNOR (Resident Not Ordinarily Resident)</p>
+            <p className="text-sm text-gray-600 mt-2">AY 2026-27 | FY 2025-26</p>
+            <div className="mt-3 space-y-1 text-sm text-gray-600">
+              <p>• Foreign income & remittances</p>
+              <p>• Regular savings account</p>
+              <p>• Home ownership in India</p>
             </div>
           </div>
         </div>
       </section>
 
-      {/* CTA Section */}
-      <section className="text-center py-12">
-        <h2 className="text-2xl font-bold text-gray-900 mb-4">Ready to file your ITR?</h2>
-        <p className="text-gray-600 mb-8">Start with documents, get AI guidance, and file with confidence</p>
-        <Link href="/documents">
-          <button className="btn-primary text-lg px-8 py-3">
-            Begin Filing Process →
-          </button>
-        </Link>
+      {/* Quick Stats */}
+      <section className="grid grid-cols-1 md:grid-cols-3 gap-6">
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <p className="text-3xl font-bold text-primary-600 mb-1">18+</p>
+          <p className="text-gray-600">Required Documents</p>
+        </div>
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <p className="text-3xl font-bold text-green-600 mb-1">6</p>
+          <p className="text-gray-600">Portal Sources</p>
+        </div>
+        <div className="bg-white rounded-lg border border-gray-200 p-6">
+          <p className="text-3xl font-bold text-purple-600 mb-1">100%</p>
+          <p className="text-gray-600">ITR-2 Ready</p>
+        </div>
       </section>
     </div>
   );
 }
-

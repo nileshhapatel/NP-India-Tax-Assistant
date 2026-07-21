@@ -74,13 +74,15 @@ This creates:
 
 The seed is idempotent; rerunning it will not duplicate the initial case.
 
-## 6. Run
+## 6. Run and verify
 
 ```bash
-streamlit run app.py
+./launch.sh
 ```
 
-Open the local address shown by Streamlit, normally `http://localhost:8501`.
+This one command installs missing dependencies, builds the app, starts Docker, checks PostgreSQL connectivity, validates the main API routes, and confirms the logs are clean.
+
+Open the UI at `http://localhost:3000`.
 
 ## Recommended workflow
 

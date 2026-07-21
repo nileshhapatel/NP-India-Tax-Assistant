@@ -6,3 +6,5 @@ private_data/
 .DS_Store
 # System dumps
 core
+frontend/node_modules/
+frontend/.next/
