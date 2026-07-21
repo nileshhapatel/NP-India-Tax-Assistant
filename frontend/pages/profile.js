@@ -1,311 +1,382 @@
-import { useState, useEffect } from 'react';
-import { User, Users, MapPin, FileText, Loader2, AlertCircle, Check } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { User, Save, Loader2, AlertCircle, CheckCircle2, Pencil, X, MapPin } from 'lucide-react';
 import useSWR from 'swr';
+import { fetcher } from '../lib/api';
+import { useCaseContext } from '../lib/case-context';
 
-const fetcher = (url) => fetch(url).then((res) => res.json());
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
+const apiUrl = (path) => `${API_BASE_URL}${path}`;
+
+const EMPTY_PROFILE = {
+  name: '',
+  pan_last4: '',
+  pan_full: '',
+  citizenship: 'Indian',
+  date_of_birth: '',
+  marital_status: '',
+  occupation: '',
+  employer_name: '',
+  email: '',
+  mobile_country_code: '+91',
+  mobile_primary: '',
+  aadhaar_mobile_country_code: '+91',
+  aadhaar_mobile: '',
+  alt_mobiles: '',
+  aadhaar_last4: '',
+  aadhaar_full: '',
+  passport_last4: '',
+  passport_full: '',
+  emergency_contact_name: '',
+  emergency_contact_mobile: '',
+  permanent_address: '',
+  mailing_address: '',
+  city: '',
+  state: '',
+  postal_code: '',
+  country: 'India',
+  refund_account_last4: '',
+  refund_ifsc: '',
+  preferred_contact_mode: 'email',
+  communication_notes: '',
+};
+
+const COUNTRY_OPTIONS = [
+  { label: 'India', value: 'India', code: '+91' },
+  { label: 'US', value: 'US', code: '+1' },
+];
+
+const label = (v) => (v === null || v === undefined || v === '' ? '—' : v);
+const masked = (v) => {
+  if (!v) return '—';
+  const str = String(v);
+  if (str.length <= 4) return str;
+  return `${'•'.repeat(Math.max(0, str.length - 4))}${str.slice(-4)}`;
+};
+const last4 = (v) => {
+  if (!v) return '';
+  const s = String(v);
+  return s.length <= 4 ? s : s.slice(-4);
+};
+
+function ReadItem({ title, value }) {
+  return (
+    <div className="rounded-lg border border-gray-200 p-3 bg-gray-50">
+      <p className="text-xs text-gray-500">{title}</p>
+      <p className="text-sm font-medium text-gray-900 mt-1 break-words">{label(value)}</p>
+    </div>
+  );
+}
+
+function TextInput({ title, value, onChange, type = 'text', placeholder = '', maxLength }) {
+  return (
+    <label className="block">
+      <span className="block text-sm font-medium text-gray-700">{title}</span>
+      <input
+        type={type}
+        value={value || ''}
+        onChange={onChange}
+        maxLength={maxLength}
+        placeholder={placeholder}
+        className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2"
+      />
+    </label>
+  );
+}
 
 export default function Profile() {
-  const { data: taxpayersData, error, isLoading, mutate } = useSWR('/api/taxpayers', fetcher);
-  const [selectedTaxpayer, setSelectedTaxpayer] = useState(1);
-  const [editMode, setEditMode] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [formData, setFormData] = useState({});
+  const { selectedTaxpayerId, selectedMember, selectedCase } = useCaseContext();
+  const taxpayerId = selectedTaxpayerId || selectedMember?.id;
+  const { data, error, isLoading, mutate } = useSWR(
+    taxpayerId ? apiUrl(`/api/taxpayers/${taxpayerId}/profile`) : null,
+    fetcher
+  );
+  const [formData, setFormData] = useState(EMPTY_PROFILE);
+  const [saving, setSaving] = useState(false);
+  const [isEditing, setIsEditing] = useState(false);
   const [message, setMessage] = useState('');
+  const [postalHint, setPostalHint] = useState('');
 
-  useEffect(() => {
-    if (taxpayersData) {
-      const taxpayers = taxpayersData?.taxpayers || [];
-      const current = taxpayers.find((t) => t.id === selectedTaxpayer);
-      if (current) {
-        setFormData({
-          name: current.name,
-          citizenship: current.citizenship,
-          pan_last4: current.pan_last4 || '',
-          has_dependent_child: current.has_dependent_child,
-        });
-      }
-    }
-  }, [selectedTaxpayer, taxpayersData]);
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-96">
-        <Loader2 className="w-8 h-8 animate-spin text-primary-600" />
-      </div>
-    );
-  }
-
-  if (error) {
-    return (
-      <div className="card border-danger-300 bg-danger-50 p-6">
-        <AlertCircle className="w-5 h-5 text-danger-600 mb-2" />
-        <p className="text-danger-700">Failed to load taxpayer profile</p>
-      </div>
-    );
-  }
-
-  const taxpayers = taxpayersData?.taxpayers || [];
-  const current = taxpayers.find((t) => t.id === selectedTaxpayer);
-
-  const handleSave = async () => {
-    setLoading(true);
-    setMessage('');
-    try {
-      const res = await fetch(`/api/taxpayers/${selectedTaxpayer}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
-      });
-      const result = await res.json();
-      if (result.ok) {
-        setMessage('✅ Profile saved successfully');
-        setEditMode(false);
-        mutate(); // Refresh data
-        setTimeout(() => setMessage(''), 3000);
-      } else {
-        setMessage('❌ Error: ' + (result.error || 'Unknown error'));
-      }
-    } catch (err) {
-      setMessage('❌ Error: ' + err.message);
-    }
-    setLoading(false);
-  };
-
-  const handleInputChange = (e) => {
-    const { name, value, type, checked } = e.target;
+  const hydrateFromData = () => {
+    if (!data) return;
     setFormData({
-      ...formData,
-      [name]: type === 'checkbox' ? checked : value,
+      ...EMPTY_PROFILE,
+      ...data.taxpayer,
+      ...(data.profile || {}),
+      date_of_birth: data.profile?.date_of_birth || '',
     });
   };
 
+  useEffect(() => {
+    if (!data) return;
+    hydrateFromData();
+    setIsEditing(false);
+  }, [data]);
+
+  const validationError = useMemo(() => {
+    if (formData.pan_last4 && !/^[A-Za-z0-9]{4}$/.test(formData.pan_last4)) return 'PAN Last 4 must be exactly 4 alphanumeric characters.';
+    if (formData.pan_full && !/^[A-Za-z]{5}\d{4}[A-Za-z]$/.test(formData.pan_full)) return 'PAN format must be like ABCDE1234F.';
+    if (formData.mobile_primary && !/^\d{10}$/.test(formData.mobile_primary)) return 'Primary mobile must be 10 digits.';
+    if (formData.aadhaar_mobile && !/^\d{10}$/.test(formData.aadhaar_mobile)) return 'Aadhaar-linked mobile must be 10 digits.';
+    if (formData.aadhaar_full && !/^\d{12}$/.test(formData.aadhaar_full)) return 'Aadhaar must be 12 digits.';
+    if (formData.aadhaar_last4 && !/^\d{4}$/.test(formData.aadhaar_last4)) return 'Aadhaar last 4 must be 4 digits.';
+    if (formData.refund_account_last4 && !/^\d{4}$/.test(formData.refund_account_last4)) return 'Refund account last 4 must be 4 digits.';
+    if (formData.country === 'India' && formData.postal_code && !/^\d{6}$/.test(formData.postal_code)) return 'Indian PIN must be 6 digits.';
+    if (formData.country === 'US' && formData.postal_code && !/^\d{5}(\d{4})?$/.test(formData.postal_code.replace(/-/g, ''))) return 'US ZIP must be 5 or 9 digits.';
+    return '';
+  }, [formData]);
+
+  const setField = (key, value) => setFormData((prev) => ({ ...prev, [key]: value }));
+
+  const lookupPostal = async () => {
+    if (!formData.postal_code || !formData.country) return;
+    setPostalHint('Validating postal code...');
+    try {
+      const res = await fetch(apiUrl(`/api/reference/postal-lookup?country=${encodeURIComponent(formData.country)}&postal_code=${encodeURIComponent(formData.postal_code)}`));
+      const payload = await res.json();
+      if (payload.ok && payload.valid) {
+        setFormData((prev) => ({
+          ...prev,
+          city: payload.city || prev.city,
+          state: payload.state || prev.state,
+          country: payload.suggested_country || prev.country,
+        }));
+        setPostalHint(`Validated: ${payload.city || '—'}, ${payload.state || '—'}`);
+      } else {
+        setPostalHint(payload.message || 'Postal code not found');
+      }
+    } catch (e) {
+      setPostalHint(`Lookup failed: ${e.message}`);
+    }
+  };
+
+  const onCountryChange = (country) => {
+    const selected = COUNTRY_OPTIONS.find((c) => c.value === country);
+    setFormData((prev) => ({
+      ...prev,
+      country,
+      mobile_country_code: selected?.code || prev.mobile_country_code,
+      aadhaar_mobile_country_code: selected?.code || prev.aadhaar_mobile_country_code,
+    }));
+  };
+
+  const saveProfile = async () => {
+    if (!taxpayerId || validationError) return;
+    setSaving(true);
+    setMessage('');
+    try {
+      const payload = {
+        ...formData,
+        pan_last4: (formData.pan_last4 || '').toUpperCase(),
+        pan_full: (formData.pan_full || '').toUpperCase(),
+        passport_full: (formData.passport_full || '').toUpperCase(),
+        passport_last4: (formData.passport_last4 || '').toUpperCase(),
+        refund_ifsc: (formData.refund_ifsc || '').toUpperCase(),
+      };
+      const res = await fetch(apiUrl(`/api/taxpayers/${taxpayerId}`), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const result = await res.json();
+      if (!result.ok) throw new Error(result.error || 'Failed to save profile');
+      setMessage('Profile updated successfully.');
+      setIsEditing(false);
+      await mutate();
+    } catch (e) {
+      setMessage(`Error: ${e.message}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (isLoading) {
+    return <div className="flex items-center justify-center min-h-screen"><Loader2 className="w-8 h-8 animate-spin text-primary-600" /></div>;
+  }
+
+  if (error) {
+    return <div className="flex items-center gap-2 text-red-600"><AlertCircle className="w-6 h-6" /><span>Error loading profile</span></div>;
+  }
+
   return (
-    <div className="space-y-8">
-      {/* Header */}
-      <div>
-        <h1 className="text-4xl font-bold text-gray-900 mb-2">👤 Household Profile</h1>
-        <p className="text-lg text-gray-600">Manage taxpayer information and family details</p>
-      </div>
-
-      {/* Taxpayer Selection */}
-      <div>
-        <h2 className="text-xl font-bold text-gray-900 mb-4">Select Taxpayer</h2>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {taxpayers.map((tp) => (
-            <div
-              key={tp.id}
-              onClick={() => {
-                setSelectedTaxpayer(tp.id);
-                setEditMode(false);
-                setMessage('');
-              }}
-              className={`card p-6 cursor-pointer transition ${
-                selectedTaxpayer === tp.id
-                  ? 'border-primary-500 border-2 bg-primary-50'
-                  : 'hover:shadow-md'
-              }`}
-            >
-              <div className="flex items-start justify-between mb-4">
-                <div>
-                  <h3 className="font-bold text-lg text-gray-900">{tp.name}</h3>
-                  <p className="text-sm text-gray-600">{tp.citizenship} Citizen</p>
-                </div>
-                <span className="badge badge-primary">{tp.id === 1 ? 'NRI' : 'RNOR'}</span>
-              </div>
-              <div className="space-y-2 text-sm">
-                <div className="flex items-center gap-2">
-                  <FileText className="w-4 h-4 text-gray-400" />
-                  <span className="text-gray-600">PAN: {tp.pan_last4 || 'Not provided'}</span>
-                </div>
-                {tp.has_dependent_child && (
-                  <div className="flex items-center gap-2">
-                    <Users className="w-4 h-4 text-gray-400" />
-                    <span className="text-gray-600">Has dependent child</span>
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
+    <div className="space-y-6">
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          <User className="w-8 h-8 text-primary-600" />
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900">Taxpayer Profile</h1>
+            <p className="text-gray-600">
+              Linked to {selectedMember?.name || 'taxpayer'} • FY {selectedCase?.financial_year || '—'} • AY {selectedCase?.assessment_year || '—'}
+            </p>
+          </div>
         </div>
+        {!isEditing ? (
+          <button onClick={() => { setIsEditing(true); setMessage(''); }} className="inline-flex items-center gap-2 rounded-lg bg-primary-600 text-white px-4 py-2 hover:bg-primary-700">
+            <Pencil className="w-4 h-4" /> Edit Profile
+          </button>
+        ) : (
+          <button onClick={() => { setIsEditing(false); setMessage(''); hydrateFromData(); }} className="inline-flex items-center gap-2 rounded-lg bg-gray-200 text-gray-900 px-4 py-2 hover:bg-gray-300">
+            <X className="w-4 h-4" /> Cancel
+          </button>
+        )}
       </div>
 
-      {/* Profile Details */}
-      {current && (
-        <div className="space-y-6">
-          <div className="flex items-center justify-between">
-            <h2 className="text-2xl font-bold text-gray-900">{current.name}'s Profile</h2>
-            <button
-              onClick={() => setEditMode(!editMode)}
-              className={editMode ? 'btn-secondary' : 'btn-primary'}
-            >
-              {editMode ? 'Cancel' : 'Edit Profile'}
-            </button>
+      {validationError && <div className="p-3 rounded-lg bg-red-50 text-red-700 text-sm">{validationError}</div>}
+      {postalHint && <div className="p-3 rounded-lg bg-blue-50 text-blue-700 text-sm">{postalHint}</div>}
+
+      {!isEditing ? (
+        <div className="space-y-4">
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
+            <h2 className="text-lg font-semibold text-gray-900 mb-3">Identity</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <ReadItem title="Full Name" value={formData.name} />
+              <ReadItem title="PAN" value={masked(formData.pan_full)} />
+              <ReadItem title="PAN Last 4 (auto)" value={formData.pan_last4 || last4(formData.pan_full)} />
+              <ReadItem title="Aadhaar" value={masked(formData.aadhaar_full)} />
+              <ReadItem title="Aadhaar Last 4 (auto)" value={formData.aadhaar_last4 || last4(formData.aadhaar_full)} />
+              <ReadItem title="Passport" value={masked(formData.passport_full)} />
+              <ReadItem title="Passport Last 4 (auto)" value={formData.passport_last4 || last4(formData.passport_full)} />
+              <ReadItem title="Citizenship" value={formData.citizenship} />
+              <ReadItem title="Date of Birth" value={formData.date_of_birth} />
+            </div>
           </div>
 
-          {/* Message */}
-          {message && (
-            <div className={`card p-4 border ${message.includes('✅') ? 'border-success-300 bg-success-50' : 'border-danger-300 bg-danger-50'}`}>
-              <p className={message.includes('✅') ? 'text-success-700' : 'text-danger-700'}>{message}</p>
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
+            <h2 className="text-lg font-semibold text-gray-900 mb-3">Contact & Address</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <ReadItem title="Email" value={formData.email} />
+              <ReadItem title="Primary Mobile" value={`${label(formData.mobile_country_code)} ${label(formData.mobile_primary)}`} />
+              <ReadItem title="Aadhaar-linked Mobile" value={`${label(formData.aadhaar_mobile_country_code)} ${label(formData.aadhaar_mobile)}`} />
+              <ReadItem title="Alternative Mobile(s)" value={formData.alt_mobiles} />
+              <ReadItem title="City" value={formData.city} />
+              <ReadItem title="State" value={formData.state} />
+              <ReadItem title="Postal Code" value={formData.postal_code} />
+              <ReadItem title="Country" value={formData.country} />
+              <ReadItem title="Preferred Contact Mode" value={formData.preferred_contact_mode} />
             </div>
-          )}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+              <ReadItem title="Permanent Address" value={formData.permanent_address} />
+              <ReadItem title="Current Mailing Address" value={formData.mailing_address} />
+            </div>
+          </div>
 
-          {/* Basic Information */}
-          <div className="card p-6">
-            <h3 className="font-bold text-lg text-gray-900 mb-6">Basic Information</h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Full Name</label>
-                <input
-                  type="text"
-                  name="name"
-                  value={formData.name || ''}
-                  onChange={handleInputChange}
-                  disabled={!editMode}
-                  className={`input w-full ${!editMode && 'bg-gray-50'}`}
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Citizenship</label>
-                <input
-                  type="text"
-                  name="citizenship"
-                  value={formData.citizenship || ''}
-                  onChange={handleInputChange}
-                  disabled={!editMode}
-                  className={`input w-full ${!editMode && 'bg-gray-50'}`}
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">PAN (Last 4)</label>
-                <input
-                  type="text"
-                  name="pan_last4"
-                  value={formData.pan_last4 || ''}
-                  onChange={handleInputChange}
-                  disabled={!editMode}
-                  placeholder="XXXX"
-                  maxLength="4"
-                  className={`input w-full ${!editMode && 'bg-gray-50'}`}
-                />
-              </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">Status</label>
-                <div className={`input w-full bg-gray-50 flex items-center ${current.id === 1 ? 'text-orange-600' : 'text-purple-600'}`}>
-                  {current.id === 1 ? '🌍 Non-Resident (NRI)' : '🏘️ Resident Not Ordinary (RNOR)'}
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
+            <h2 className="text-lg font-semibold text-gray-900 mb-3">Compliance & Refund</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <ReadItem title="Marital Status" value={formData.marital_status} />
+              <ReadItem title="Occupation" value={formData.occupation} />
+              <ReadItem title="Employer Name" value={formData.employer_name} />
+              <ReadItem title="Emergency Contact Name" value={formData.emergency_contact_name} />
+              <ReadItem title="Emergency Contact Mobile" value={formData.emergency_contact_mobile} />
+              <ReadItem title="Refund A/c Last 4" value={formData.refund_account_last4} />
+              <ReadItem title="Refund IFSC" value={formData.refund_ifsc} />
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="bg-white rounded-lg border border-gray-200 p-6 space-y-6">
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900 mb-3">Identity</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <TextInput title="Full Name" value={formData.name} onChange={(e) => setField('name', e.target.value)} />
+              <TextInput title="PAN (Full)" value={formData.pan_full} onChange={(e) => setField('pan_full', e.target.value.toUpperCase())} maxLength={10} />
+              <TextInput title="Aadhaar (Full)" value={formData.aadhaar_full} onChange={(e) => setField('aadhaar_full', e.target.value.replace(/\D/g, ''))} maxLength={12} />
+              <TextInput title="Passport (Full)" value={formData.passport_full} onChange={(e) => setField('passport_full', e.target.value.toUpperCase())} maxLength={30} />
+              <ReadItem title="PAN Last 4 (auto from full)" value={last4(formData.pan_full)} />
+              <ReadItem title="Aadhaar Last 4 (auto from full)" value={last4(formData.aadhaar_full)} />
+              <ReadItem title="Passport Last 4 (auto from full)" value={last4(formData.passport_full)} />
+              <TextInput title="Date of Birth" type="date" value={formData.date_of_birth} onChange={(e) => setField('date_of_birth', e.target.value)} />
+              <TextInput title="Citizenship" value={formData.citizenship} onChange={(e) => setField('citizenship', e.target.value)} />
+            </div>
+          </div>
+
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900 mb-3">Contact</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <TextInput title="Email" type="email" value={formData.email} onChange={(e) => setField('email', e.target.value)} />
+              <label className="block">
+                <span className="block text-sm font-medium text-gray-700">Country</span>
+                <select value={formData.country} onChange={(e) => onCountryChange(e.target.value)} className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2">
+                  {COUNTRY_OPTIONS.map((c) => <option key={c.value} value={c.value}>{c.label}</option>)}
+                </select>
+              </label>
+              <label className="block">
+                <span className="block text-sm font-medium text-gray-700">Primary Mobile</span>
+                <div className="mt-1 flex gap-2">
+                  <select value={formData.mobile_country_code || '+91'} onChange={(e) => setField('mobile_country_code', e.target.value)} className="w-24 rounded-lg border border-gray-300 px-2 py-2">
+                    <option value="+91">+91</option>
+                    <option value="+1">+1</option>
+                  </select>
+                  <input value={formData.mobile_primary || ''} onChange={(e) => setField('mobile_primary', e.target.value.replace(/\D/g, ''))} maxLength={10} className="flex-1 rounded-lg border border-gray-300 px-3 py-2" />
                 </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Dependent Information */}
-          <div className="card p-6">
-            <h3 className="font-bold text-lg text-gray-900 mb-6">Family & Dependents</h3>
-            <div className="space-y-4">
-              <div className="flex items-center gap-3">
-                <input
-                  type="checkbox"
-                  name="has_dependent_child"
-                  checked={formData.has_dependent_child || false}
-                  onChange={handleInputChange}
-                  disabled={!editMode}
-                  className="w-5 h-5 rounded border-gray-300"
-                />
-                <label className="text-gray-700 font-medium">Has dependent child</label>
-              </div>
-
-              {(formData.has_dependent_child || current.has_dependent_child) && (
-                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-4 mt-4">
-                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-2">Child's Name</label>
-                      <input type="text" disabled className="input w-full bg-gray-50" placeholder="Dependent name" />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-2">Age (Years)</label>
-                      <input type="number" disabled className="input w-full bg-gray-50" placeholder="Age" />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-2">Country of Residence</label>
-                      <input
-                        type="text"
-                        value={current.dependent_child_country_of_residence || 'India'}
-                        disabled
-                        className="input w-full bg-gray-50"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-2">Citizenship</label>
-                      <input type="text" disabled className="input w-full bg-gray-50" placeholder="Citizenship" />
-                    </div>
-                  </div>
-
-                  {current.is_eligible_for_80ac && (
-                    <div className="bg-success-50 border border-success-300 rounded p-3 flex items-start gap-3">
-                      <span className="text-2xl">✅</span>
-                      <div>
-                        <p className="font-medium text-success-900">Section 80AC Eligible</p>
-                        <p className="text-sm text-success-700">Dependent child qualifies for Sukanya Samriddhi deduction (₹1,50,000/year)</p>
-                      </div>
-                    </div>
-                  )}
+              </label>
+              <label className="block">
+                <span className="block text-sm font-medium text-gray-700">Aadhaar-linked Mobile</span>
+                <div className="mt-1 flex gap-2">
+                  <select value={formData.aadhaar_mobile_country_code || '+91'} onChange={(e) => setField('aadhaar_mobile_country_code', e.target.value)} className="w-24 rounded-lg border border-gray-300 px-2 py-2">
+                    <option value="+91">+91</option>
+                    <option value="+1">+1</option>
+                  </select>
+                  <input value={formData.aadhaar_mobile || ''} onChange={(e) => setField('aadhaar_mobile', e.target.value.replace(/\D/g, ''))} maxLength={10} className="flex-1 rounded-lg border border-gray-300 px-3 py-2" />
                 </div>
-              )}
+              </label>
+              <TextInput title="Alternative Mobile(s)" value={formData.alt_mobiles} onChange={(e) => setField('alt_mobiles', e.target.value)} placeholder="Comma separated" />
+              <TextInput title="Emergency Contact Name" value={formData.emergency_contact_name} onChange={(e) => setField('emergency_contact_name', e.target.value)} />
+              <TextInput title="Emergency Contact Mobile" value={formData.emergency_contact_mobile} onChange={(e) => setField('emergency_contact_mobile', e.target.value.replace(/\D/g, ''))} maxLength={10} />
             </div>
           </div>
 
-          {/* Residency Information */}
-          <div className="card p-6">
-            <h3 className="font-bold text-lg text-gray-900 mb-6 flex items-center gap-2">
-              <MapPin className="w-5 h-5 text-primary-600" />
-              Residency Status
-            </h3>
-            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-              <p className="text-sm text-gray-700 mb-4">
-                {current.id === 1
-                  ? 'You are registered as an NRI (Non-Resident Individual). This status requires maintaining <60 days presence in India (current FY) AND <183 days in prior 4 FYs.'
-                  : 'You are registered as RNOR (Resident Not Ordinarily Resident). This status applies when you are resident but not for 2 of prior 10 years.'}
-              </p>
-              <button className="btn-secondary text-sm">
-                Update Residency Details →
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900 mb-3">Address & Validation</h2>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <TextInput title="Postal Code" value={formData.postal_code} onChange={(e) => setField('postal_code', e.target.value.trim())} />
+              <button onClick={lookupPostal} type="button" className="h-fit mt-7 inline-flex items-center gap-2 rounded-lg bg-blue-600 text-white px-3 py-2 hover:bg-blue-700">
+                <MapPin className="w-4 h-4" /> Validate postal code
               </button>
+              <TextInput title="City" value={formData.city} onChange={(e) => setField('city', e.target.value)} />
+              <TextInput title="State" value={formData.state} onChange={(e) => setField('state', e.target.value)} />
+              <label className="block">
+                <span className="block text-sm font-medium text-gray-700">Preferred Contact Mode</span>
+                <select value={formData.preferred_contact_mode || 'email'} onChange={(e) => setField('preferred_contact_mode', e.target.value)} className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2">
+                  <option value="email">Email</option>
+                  <option value="mobile">Mobile</option>
+                  <option value="whatsapp">WhatsApp</option>
+                </select>
+              </label>
+              <TextInput title="Marital Status" value={formData.marital_status} onChange={(e) => setField('marital_status', e.target.value)} placeholder="Single / Married" />
+              <TextInput title="Occupation" value={formData.occupation} onChange={(e) => setField('occupation', e.target.value)} />
+              <TextInput title="Employer Name" value={formData.employer_name} onChange={(e) => setField('employer_name', e.target.value)} />
+              <TextInput title="Refund A/c Last 4" value={formData.refund_account_last4} onChange={(e) => setField('refund_account_last4', e.target.value.replace(/\D/g, ''))} maxLength={4} />
+              <TextInput title="Refund IFSC" value={formData.refund_ifsc} onChange={(e) => setField('refund_ifsc', e.target.value.toUpperCase())} maxLength={20} />
             </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-4">
+              <label className="block">
+                <span className="block text-sm font-medium text-gray-700">Permanent Address</span>
+                <textarea value={formData.permanent_address || ''} onChange={(e) => setField('permanent_address', e.target.value)} className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 min-h-20" />
+              </label>
+              <label className="block">
+                <span className="block text-sm font-medium text-gray-700">Current Mailing Address</span>
+                <textarea value={formData.mailing_address || ''} onChange={(e) => setField('mailing_address', e.target.value)} className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 min-h-20" />
+              </label>
+            </div>
+            <label className="block mt-4">
+              <span className="block text-sm font-medium text-gray-700">Communication Notes</span>
+              <textarea value={formData.communication_notes || ''} onChange={(e) => setField('communication_notes', e.target.value)} className="mt-1 w-full rounded-lg border border-gray-300 px-3 py-2 min-h-20" />
+            </label>
           </div>
 
-          {editMode && (
-            <div className="flex gap-3">
-              <button
-                onClick={handleSave}
-                disabled={loading}
-                className="btn-primary"
-              >
-                {loading ? 'Saving...' : 'Save Changes'}
-              </button>
-              <button
-                onClick={() => {
-                  setEditMode(false);
-                  setMessage('');
-                }}
-                className="btn-secondary"
-              >
-                Discard
-              </button>
-            </div>
-          )}
+          <button onClick={saveProfile} disabled={saving || !!validationError} className="inline-flex items-center gap-2 rounded-lg bg-primary-600 text-white px-4 py-2 hover:bg-primary-700 disabled:bg-gray-400">
+            <Save className="w-4 h-4" />
+            {saving ? 'Saving...' : 'Save Profile'}
+          </button>
         </div>
       )}
 
-      {/* CTA */}
-      <div className="bg-gradient-to-r from-primary-600 to-blue-600 rounded-xl p-8 text-white">
-        <h3 className="text-2xl font-bold mb-4">Manage Your Household</h3>
-        <p className="mb-6 text-blue-100">
-          Keep your family information up-to-date to ensure accurate tax calculations and deduction eligibility.
-        </p>
-        <a href="/income">
-          <button className="bg-white text-primary-600 font-medium px-6 py-2 rounded-lg hover:bg-blue-50 transition">
-            Complete Income Details →
-          </button>
-        </a>
-      </div>
+      {message && (
+        <div className={`p-3 rounded-lg text-sm flex items-center gap-2 ${message.startsWith('Error') ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
+          <CheckCircle2 className="w-4 h-4" />
+          {message}
+        </div>
+      )}
     </div>
   );
 }

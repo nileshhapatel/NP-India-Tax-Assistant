@@ -1,19 +1,57 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.responses import JSONResponse, Response
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, Dict, Optional, List
 from decimal import Decimal
 import os
+import csv
+import io
+from datetime import datetime
+import requests
 from dotenv import load_dotenv
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
 
+DOCUMENT_PORTAL_MAP = {
+    "PORTAL_AIS": ("Income Tax Portal - AIS", "https://www.incometax.gov.in/iec/foportal/"),
+    "PORTAL_TIS": ("Income Tax Portal - TIS", "https://www.incometax.gov.in/iec/foportal/"),
+    "PORTAL_26AS": ("Income Tax Portal / TRACES - 26AS", "https://www.incometax.gov.in/iec/foportal/"),
+    "PRIOR_ITR": ("Income Tax Portal - Downloaded Documents", "https://www.incometax.gov.in/iec/foportal/"),
+    "MF_CAS": ("CAMS", "https://www.camsonline.com/"),
+    "MF_CG": ("KFintech", "https://mfs.kfintech.com/"),
+    "ZERODHA_DIV": ("Zerodha Console", "https://console.zerodha.com/"),
+    "ZERODHA_TAXPL": ("Zerodha Console", "https://console.zerodha.com/"),
+    "ZERODHA_LEDGER": ("Zerodha Console", "https://console.zerodha.com/"),
+}
+
+COMMON_DOC_PREFIXES = (
+    "ID_",
+    "HOUSE_",
+    "LOAN_",
+    "TRAVEL_",
+    "PRIOR_",
+    "PORTAL_",
+)
+
 # Import models from existing workspace
 try:
-    from itr_workspace.models import Taxpayer, TaxCase, DocumentRequirement
+    from itr_workspace.models import (
+        Taxpayer,
+        TaxCase,
+        DocumentRequirement,
+        ResidencyRecord,
+        TaxCredit,
+        PropertyLoan,
+        AuditLog,
+        Task,
+        ReconciliationItem,
+        IncomeEntry as IncomeEntryModel,
+    )
     from itr_workspace.tax_calculator import (
         TaxFilingCalculator,
         TaxRegime,
@@ -26,9 +64,189 @@ except Exception as e:
     Taxpayer = None
     TaxCase = None
     DocumentRequirement = None
+    ResidencyRecord = None
+    TaxCredit = None
+    PropertyLoan = None
+    AuditLog = None
+    Task = None
+    ReconciliationItem = None
+    IncomeEntryModel = None
     TaxFilingCalculator = None
     TaxRegime = None
     ResidentialStatus = None
+
+
+def _case_progress(session, case_id: int) -> dict:
+    docs = session.scalars(select(DocumentRequirement).where(DocumentRequirement.case_id == case_id)).all()
+    tasks = session.scalars(select(Task).where(Task.case_id == case_id)).all()
+    required_docs = [d for d in docs if d.required]
+    done_docs = [d for d in required_docs if d.status in {"Received", "Verified", "Not applicable"}]
+    done_tasks = [t for t in tasks if t.status in {"Complete", "Not applicable"}]
+    doc_pct = round(100 * len(done_docs) / len(required_docs), 1) if required_docs else 100.0
+    task_pct = round(100 * len(done_tasks) / len(tasks), 1) if tasks else 100.0
+    overall = round((doc_pct * 0.6) + (task_pct * 0.4), 1)
+    return {
+        "documents": doc_pct,
+        "tasks": task_pct,
+        "overall": overall,
+        "missing_required": len(required_docs) - len(done_docs),
+        "open_tasks": len(tasks) - len(done_tasks),
+    }
+
+
+def _review_checks(session, case) -> list[dict]:
+    checks = []
+    seen_messages = set()
+
+    def add_check(item: dict):
+        key = (item.get("severity"), item.get("area"), item.get("message"))
+        if key in seen_messages:
+            return
+        seen_messages.add(key)
+        checks.append(item)
+
+    docs = session.scalars(select(DocumentRequirement).where(DocumentRequirement.case_id == case.id)).all()
+    missing = [d.title for d in docs if d.required and d.status == "Missing"]
+    if missing:
+        add_check({"severity": "BLOCK", "area": "Documents", "message": f"{len(missing)} required documents are still missing."})
+    residency = session.scalar(select(ResidencyRecord).where(ResidencyRecord.case_id == case.id))
+    if not residency or residency.days_in_india_current_fy is None:
+        add_check({"severity": "BLOCK", "area": "Residency", "message": "Current-FY India presence days have not been entered."})
+    elif residency.conclusion and residency.conclusion != case.residential_status:
+        add_check({
+            "severity": "BLOCK",
+            "area": "Residency",
+            "message": f"Residency worksheet concludes {residency.conclusion}, but case is set to {case.residential_status}.",
+        })
+    incomes = session.scalars(select(IncomeEntryModel).where(IncomeEntryModel.case_id == case.id)).all()
+    for i in incomes:
+        if float(getattr(i, "amount_in_return", 0) or 0) == 0 and float(getattr(i, "gross_amount", 0) or 0) > 0 and float(getattr(i, "exempt_amount", 0) or 0) == 0:
+            add_check({"severity": "WARN", "area": "Income", "message": f"{i.source_name}: gross income exists but return amount and exempt amount are both zero."})
+        if float(getattr(i, "tds_amount", 0) or 0) > float(getattr(i, "gross_amount", 0) or 0):
+            add_check({"severity": "BLOCK", "area": "Income", "message": f"{i.source_name}: TDS exceeds gross income."})
+    if case.residential_status in {"NRI", "RNOR"} and case.return_form == "ITR-1":
+        add_check({"severity": "BLOCK", "area": "Return form", "message": "ITR-1 is not appropriate for NRI/RNOR status."})
+    if not checks:
+        checks.append({"severity": "OK", "area": "Review", "message": "No automated exceptions found. Manual tax review is still required."})
+    return checks
+
+
+def _is_doc_reusable_across_years(code: str) -> bool:
+    return bool(code and (code.startswith(COMMON_DOC_PREFIXES) or code.endswith("_DEED") or code.endswith("_PASSPORT")))
+
+
+def _task_status_suggestions(session, case) -> Dict[str, str]:
+    tasks = session.scalars(select(Task).where(Task.case_id == case.id)).all()
+    if not tasks:
+        return {}
+    docs = session.scalars(select(DocumentRequirement).where(DocumentRequirement.case_id == case.id)).all()
+    incomes = session.scalars(select(IncomeEntryModel).where(IncomeEntryModel.case_id == case.id)).all()
+    residency = session.scalar(select(ResidencyRecord).where(ResidencyRecord.case_id == case.id))
+    required_docs = [d for d in docs if d.required]
+    done_docs = [d for d in required_docs if d.status in {"Received", "Verified", "Not applicable"}]
+    doc_codes_done = {d.code for d in done_docs}
+    profile_exists = bool(session.execute(
+        text("SELECT 1 FROM taxpayer_profiles WHERE taxpayer_id = :taxpayer_id LIMIT 1"),
+        {"taxpayer_id": case.taxpayer_id},
+    ).first())
+    has_income = len(incomes) > 0
+
+    def suggested_status(code: str) -> str:
+        if code == "PROFILE":
+            return "In progress" if profile_exists else "Not started"
+        if code == "RESIDENCY":
+            return "In progress" if residency and residency.days_in_india_current_fy is not None else "Not started"
+        if code == "DOCS":
+            if not required_docs:
+                return "Not started"
+            if len(done_docs) == len(required_docs):
+                return "In progress"
+            return "In progress" if len(done_docs) > 0 else "Not started"
+        if code == "BANK_RECON":
+            bank_codes = {d.code for d in required_docs if "_STMT" in d.code or "_INT" in d.code}
+            if bank_codes and bank_codes.issubset(doc_codes_done):
+                return "In progress"
+            return "Not started"
+        if code == "DIV_RECON":
+            needed = {"ZERODHA_DIV", "ZERODHA_TAXPL"}
+            return "In progress" if needed.issubset(doc_codes_done) else "Not started"
+        if code == "MF_REVIEW":
+            needed = {"MF_CAS", "MF_CG"}
+            return "In progress" if needed.issubset(doc_codes_done) else "Not started"
+        if code == "HOUSE_REVIEW":
+            needed = {"HOUSE_DEED", "HOUSE_POSSESSION", "LOAN_CERT", "LOAN_STATEMENT"}
+            completed_count = len(needed.intersection(doc_codes_done))
+            return "In progress" if completed_count > 0 else "Not started"
+        if code == "REGIME":
+            return "In progress" if (case.tax_regime or "").strip().lower() not in {"", "undecided"} else "Not started"
+        if code == "FORM":
+            return "In progress"
+        if code == "PORTAL_VALIDATE":
+            return "In progress" if case.case_status in {"Validated", "Ready to file", "Filed"} else "Not started"
+        if code == "FILE_VERIFY":
+            return "In progress" if case.acknowledgement_no else "Not started"
+        return "Not started"
+
+    return {task.code: suggested_status(task.code) for task in tasks}
+
+
+def _recommend_itr_form(session, case) -> dict:
+    incomes = session.scalars(select(IncomeEntryModel).where(IncomeEntryModel.case_id == case.id)).all()
+    income_types = [str(getattr(i, "income_type", "") or "").lower() for i in incomes]
+    gross_income = sum(float(getattr(i, "gross_amount", 0) or 0) for i in incomes)
+    has_business_professional = any(
+        t for t in income_types
+        if any(k in t for k in ("business", "profession", "freelance", "consulting", "proprietor"))
+    )
+    has_presumptive_business = any("presumptive" in t for t in income_types)
+    has_capital_gains = any(
+        t for t in income_types
+        if any(k in t for k in ("capital_gain", "capital gains", "stcg", "ltcg"))
+    )
+    has_foreign_income = any(
+        t for t in income_types
+        if any(k in t for k in ("foreign", "overseas"))
+    )
+    is_non_resident = case.residential_status in {"NRI", "RNOR"}
+    docs = session.scalars(select(DocumentRequirement).where(DocumentRequirement.case_id == case.id)).all()
+    has_foreign_asset_doc = any((d.code or "").startswith("FOREIGN_") for d in docs)
+    has_multiple_houses = len(session.scalars(select(PropertyLoan).where(PropertyLoan.case_id == case.id)).all()) > 1
+
+    recommended = "ITR-2"
+    reason = "Defaulted to ITR-2 for individual taxpayer profile with non-business income."
+
+    if has_business_professional and has_presumptive_business and not has_capital_gains and not is_non_resident:
+        recommended = "ITR-4"
+        reason = "Presumptive business/professional income detected with resident profile."
+    elif has_business_professional:
+        recommended = "ITR-3"
+        reason = "Business/professional income detected."
+    elif is_non_resident or has_capital_gains or has_foreign_income or has_foreign_asset_doc or has_multiple_houses:
+        recommended = "ITR-2"
+        reason = "NRI/RNOR, foreign/capital-gain/multi-property profile maps to ITR-2."
+    elif gross_income <= 5000000:
+        recommended = "ITR-1"
+        reason = "Resident profile with straightforward income and total income up to ₹50L."
+    else:
+        recommended = "ITR-2"
+        reason = "Income exceeds ITR-1 scope."
+
+    return {
+        "recommended_form": recommended,
+        "current_form": case.return_form,
+        "reason": reason,
+        "signals": {
+            "residential_status": case.residential_status,
+            "gross_income": gross_income,
+            "has_business_professional_income": has_business_professional,
+            "has_presumptive_business_income": has_presumptive_business,
+            "has_capital_gains": has_capital_gains,
+            "has_foreign_income": has_foreign_income,
+            "has_foreign_asset_doc": has_foreign_asset_doc,
+            "has_multiple_house_properties": has_multiple_houses,
+        },
+        "disclaimer": "This is a rule-based recommendation and should be reviewed before filing.",
+    }
 
 # If tax engine class imported, expose wrapper functions
 if 'TaxFilingCalculator' in globals() and TaxFilingCalculator is not None:
@@ -64,9 +282,6 @@ if 'TaxFilingCalculator' in globals() and TaxFilingCalculator is not None:
                 except Exception:
                     # ignore bad entries
                     pass
-        else:
-            # Fallback sample
-            calc.add_income('Salary (India-source)', Decimal('1200000'), Decimal('0'))
         return calc
 
     def calculate_filing(person, fiscal_year=None):
@@ -96,15 +311,161 @@ else:
     engine = None
     SessionLocal = None
 
+
+def _ensure_profile_table() -> None:
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS taxpayer_profiles (
+                id SERIAL PRIMARY KEY,
+                taxpayer_id INTEGER UNIQUE REFERENCES taxpayers(id) ON DELETE CASCADE,
+                mobile_primary VARCHAR(20),
+                aadhaar_mobile VARCHAR(20),
+                alt_mobiles TEXT,
+                email VARCHAR(200),
+                permanent_address TEXT,
+                mailing_address TEXT,
+                city VARCHAR(120),
+                state VARCHAR(120),
+                postal_code VARCHAR(20),
+                country VARCHAR(80),
+                date_of_birth DATE,
+                marital_status VARCHAR(30),
+                occupation VARCHAR(120),
+                employer_name VARCHAR(160),
+                aadhaar_last4 VARCHAR(4),
+                passport_last4 VARCHAR(4),
+                emergency_contact_name VARCHAR(120),
+                emergency_contact_mobile VARCHAR(20),
+                refund_account_last4 VARCHAR(4),
+                refund_ifsc VARCHAR(20),
+                preferred_contact_mode VARCHAR(20),
+                communication_notes TEXT,
+                pan_full VARCHAR(20),
+                aadhaar_full VARCHAR(20),
+                passport_full VARCHAR(30),
+                mobile_country_code VARCHAR(5),
+                aadhaar_mobile_country_code VARCHAR(5),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS date_of_birth DATE"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS marital_status VARCHAR(30)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS occupation VARCHAR(120)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS employer_name VARCHAR(160)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS aadhaar_last4 VARCHAR(4)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS passport_last4 VARCHAR(4)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS emergency_contact_name VARCHAR(120)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS emergency_contact_mobile VARCHAR(20)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS refund_account_last4 VARCHAR(4)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS refund_ifsc VARCHAR(20)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS preferred_contact_mode VARCHAR(20)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS communication_notes TEXT"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS pan_full VARCHAR(20)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS aadhaar_full VARCHAR(20)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS passport_full VARCHAR(30)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS mobile_country_code VARCHAR(5)"))
+        conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS aadhaar_mobile_country_code VARCHAR(5)"))
+
+
+_ensure_profile_table()
+
 app = FastAPI(title='ITR Family API', version='0.2')
+
+# Add CORS middleware to allow frontend at localhost:3000 to access backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        'http://localhost:3000',
+        'http://127.0.0.1:3000',
+        'http://localhost',
+        'http://127.0.0.1',
+    ],
+    allow_credentials=True,
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
 
 class TaxRequest(BaseModel):
     taxpayer: Dict[str, Any]
     fiscal_year: Optional[str] = None
 
+
+class ResidencyAssessmentRequest(BaseModel):
+    days_in_india_current_fy: int
+    days_in_india_prior_4y: int = 0
+    days_in_india_prior_7y: int = 0
+    nonresident_years_prior_10y: int = 0
+    indian_citizen_or_pio: bool = True
+    visiting_india: bool = False
+    indian_income_excluding_foreign: float = 0
+    not_liable_to_tax_elsewhere: bool = False
+
+
+def _compute_residency_status(req: ResidencyAssessmentRequest) -> Dict[str, Any]:
+    days_current = req.days_in_india_current_fy or 0
+    days_prior4 = req.days_in_india_prior_4y or 0
+    days_prior7 = req.days_in_india_prior_7y or 0
+    nonresident_years = req.nonresident_years_prior_10y or 0
+    income = float(req.indian_income_excluding_foreign or 0)
+
+    threshold = 60
+    threshold_reason = "Standard resident test uses 60 days in current FY with 365 days in prior 4 FYs."
+    if req.indian_citizen_or_pio and req.visiting_india:
+        if income > 1500000:
+            threshold = 120
+            threshold_reason = "Indian citizen/PIO visiting India with income > ₹15L uses 120-day threshold with 365-day prior 4-year condition."
+        else:
+            threshold = 182
+            threshold_reason = "Indian citizen/PIO visiting India with income ≤ ₹15L uses 182-day threshold."
+
+    resident_primary = days_current >= 182
+    resident_secondary = (days_current >= threshold and days_prior4 >= 365) if threshold < 182 else False
+    deemed_resident = bool(
+        req.indian_citizen_or_pio and income > 1500000 and req.not_liable_to_tax_elsewhere and days_current < 182
+    )
+    is_resident = resident_primary or resident_secondary or deemed_resident
+
+    if not is_resident:
+        status = "NRI"
+        status_basis = "Does not satisfy resident tests under Section 6."
+    else:
+        rnor_test = (nonresident_years >= 9) or (days_prior7 <= 729)
+        if rnor_test:
+            status = "RNOR"
+            status_basis = "Resident but satisfies RNOR conditions (non-resident history or prior 7-year stay test)."
+        else:
+            status = "ROR"
+            status_basis = "Resident and does not satisfy RNOR relaxation conditions."
+
+    checks = [
+        {"rule": "182-day resident test", "passed": resident_primary, "detail": f"Current FY days = {days_current}"},
+        {"rule": f"{threshold}-day + 365-day test", "passed": resident_secondary, "detail": f"Current FY days = {days_current}, Prior 4 FY days = {days_prior4}"},
+        {"rule": "Deemed resident test", "passed": deemed_resident, "detail": f"Income > 15L: {income > 1500000}, Not liable elsewhere: {req.not_liable_to_tax_elsewhere}"},
+    ]
+
+    return {
+        "recommended_status": status,
+        "status_basis": status_basis,
+        "threshold_reason": threshold_reason,
+        "checks": checks,
+        "government_sources": [
+            "https://www.incometax.gov.in/iec/foportal/help/individual",
+            "https://www.incometax.gov.in/iec/foportal/",
+            "Income-tax Act, 1961 - Section 6 (Residential status tests)",
+        ],
+        "disclaimer": "Rule-based recommendation only. Final determination should be reviewed with a qualified tax professional for edge cases.",
+    }
+
 @app.get('/health')
 def health():
     return {'status': 'ok'}
+
+
+@app.post('/api/residency/assess')
+def assess_residency(req: ResidencyAssessmentRequest):
+    return {'ok': True, 'assessment': _compute_residency_status(req)}
 
 
 @app.get('/api/llm/status')
@@ -129,6 +490,98 @@ def llm_status():
             'error': str(e),
             'current_provider': 'unknown',
         }
+
+
+@app.get('/api/reference/postal-lookup')
+def postal_lookup(country: str, postal_code: str):
+    country_norm = (country or '').strip().lower()
+    code = (postal_code or '').strip()
+    if not code:
+        raise HTTPException(status_code=400, detail='postal_code is required')
+    try:
+        if country_norm == 'india':
+            if not code.isdigit() or len(code) != 6:
+                return {'ok': True, 'valid': False, 'country': 'India', 'message': 'Indian PIN must be 6 digits'}
+            r = requests.get(f'https://api.postalpincode.in/pincode/{code}', timeout=8)
+            payload = r.json() if r.ok else []
+            first = payload[0] if isinstance(payload, list) and payload else {}
+            offices = first.get('PostOffice') or []
+            if not offices:
+                return {'ok': True, 'valid': False, 'country': 'India', 'message': 'PIN not found'}
+            office = offices[0]
+            return {
+                'ok': True,
+                'valid': True,
+                'country': 'India',
+                'postal_code': code,
+                'city': office.get('District'),
+                'state': office.get('State'),
+                'suggested_country': 'India',
+            }
+        if country_norm in {'us', 'usa', 'united states', 'united states of america'}:
+            if not (code.isdigit() and len(code) in {5, 9}):
+                return {'ok': True, 'valid': False, 'country': 'US', 'message': 'US ZIP must be 5 or 9 digits'}
+            query_code = code[:5]
+            r = requests.get(f'https://api.zippopotam.us/us/{query_code}', timeout=8)
+            if not r.ok:
+                return {'ok': True, 'valid': False, 'country': 'US', 'message': 'ZIP not found'}
+            payload = r.json()
+            places = payload.get('places') or []
+            place = places[0] if places else {}
+            return {
+                'ok': True,
+                'valid': True,
+                'country': 'US',
+                'postal_code': query_code,
+                'city': place.get('place name'),
+                'state': place.get('state'),
+                'suggested_country': 'US',
+            }
+        return {'ok': True, 'valid': False, 'message': 'Postal lookup currently supports India and US only'}
+    except Exception as e:
+        return {'ok': False, 'valid': False, 'message': f'Lookup failed: {e}'}
+
+
+@app.get('/api/reference/tax-credits')
+def tax_credit_reference():
+    return {
+        'ok': True,
+        'sections': [
+            {
+                'code': 'TDS',
+                'how_claimed': 'Claim based on Form 26AS/AIS and matching deductor entry.',
+                'examples': ['Salary TDS (Form 16)', 'Bank interest TDS (194A)', 'Brokerage/commission TDS (194H/194J)'],
+                'important': 'Claim should generally not exceed tax reported in Form 26AS for the same entry.',
+                'source': 'Income Tax Department portal and Form 26AS guidance',
+            },
+            {
+                'code': 'TCS',
+                'how_claimed': 'Claim as tax credit where seller/collector has reported TCS against your PAN.',
+                'examples': ['Foreign remittance TCS', 'High-value purchase TCS'],
+                'important': 'Verify collector name, amount, and PAN mapping in 26AS.',
+                'source': 'Income Tax Act TCS provisions',
+            },
+            {
+                'code': 'ADVANCE_TAX',
+                'how_claimed': 'Claim challan-based advance tax payments made during the FY.',
+                'examples': ['Quarterly self-paid tax'],
+                'important': 'Ensure BSR code/challan serial/date are correctly entered and visible in tax payment history.',
+                'source': 'Income Tax portal challan records',
+            },
+            {
+                'code': 'SELF_ASSESSMENT_TAX',
+                'how_claimed': 'Claim self-assessment tax paid before filing where applicable.',
+                'examples': ['Tax paid after final computation'],
+                'important': 'Capture challan details exactly to avoid mismatch.',
+                'source': 'Income Tax portal challan records',
+            },
+        ],
+        'gov_links': [
+            'https://www.incometax.gov.in/iec/foportal/',
+            'https://www.incometax.gov.in/iec/foportal/help/individual',
+        ],
+    }
+@app.get('/api/taxpayers')
 def list_taxpayers():
     if SessionLocal is None:
         raise HTTPException(status_code=500, detail='Database not configured')
@@ -193,18 +646,87 @@ def case_detail(case_id: int):
             },
         }
 
+
+@app.get('/api/cases/{case_id}/itr-form-recommendation')
+def get_itr_form_recommendation(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        return {'ok': True, 'recommendation': _recommend_itr_form(session, case)}
+
+
+@app.post('/api/cases/{case_id}/itr-form-recommendation/apply')
+def apply_itr_form_recommendation(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        recommendation = _recommend_itr_form(session, case)
+        case.return_form = recommendation['recommended_form']
+        session.add(case)
+        session.add(AuditLog(
+            case_id=case_id,
+            action='ITR_FORM_AUTO_SELECTED',
+            entity='TaxCase',
+            details=f"Set return_form to {case.return_form} via recommendation engine",
+        ))
+        session.commit()
+        return {'ok': True, 'return_form': case.return_form, 'recommendation': recommendation}
+
 @app.get('/api/cases/{case_id}/documents/required')
 def required_documents(case_id: int):
     if SessionLocal is None:
         raise HTTPException(status_code=500, detail='Database not configured')
     with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
         stmt = select(DocumentRequirement).where(DocumentRequirement.case_id == case_id)
         rows = session.execute(stmt).scalars().all()
+        other_cases = session.scalars(
+            select(TaxCase).where(TaxCase.taxpayer_id == case.taxpayer_id, TaxCase.id != case_id)
+        ).all()
+        other_case_ids = [c.id for c in other_cases]
+        linked_candidates = {}
+        if other_case_ids:
+            other_docs = session.scalars(
+                select(DocumentRequirement).where(
+                    DocumentRequirement.case_id.in_(other_case_ids),
+                    DocumentRequirement.file_path.is_not(None),
+                )
+            ).all()
+            for d in other_docs:
+                linked_candidates[d.code] = {'source_case_id': d.case_id, 'file_path': d.file_path}
         out = [
-            {'id': r.id, 'code': r.code, 'title': r.title, 'required': r.required, 'status': r.status}
+            {
+                'id': r.id,
+                'code': r.code,
+                'title': r.title,
+                'category': r.category,
+                'institution': r.institution,
+                'required': r.required,
+                'status': r.status,
+                'file_path': r.file_path,
+                'portal': {
+                    'name': DOCUMENT_PORTAL_MAP.get(r.code, (r.institution or 'Source Portal', None))[0],
+                    'url': DOCUMENT_PORTAL_MAP.get(r.code, (None, None))[1],
+                },
+                'reusable_across_years': _is_doc_reusable_across_years(r.code),
+                'link_candidate': linked_candidates.get(r.code),
+            }
             for r in rows
         ]
         return {'ok': True, 'documents': out}
+
+
+@app.get('/api/documents/case/{case_id}')
+def list_case_documents(case_id: int):
+    return required_documents(case_id)
 
 @app.post('/api/cases/{case_id}/documents/upload')
 def upload_document(case_id: int, file: UploadFile = File(...), code: Optional[str] = None):
@@ -225,10 +747,491 @@ def upload_document(case_id: int, file: UploadFile = File(...), code: Optional[s
             dr = session.execute(stmt).scalars().first()
             if dr:
                 dr.file_path = dest
-                dr.status = 'Uploaded'
+                dr.status = 'Received'
                 session.add(dr)
+                session.add(AuditLog(
+                    case_id=case_id,
+                    action='DOCUMENT_UPLOAD',
+                    entity='DocumentRequirement',
+                    details=f'{dr.code}:{filename}'
+                ))
+                session.commit()
+            elif DocumentRequirement is not None:
+                dr = DocumentRequirement(
+                    case_id=case_id,
+                    code=code,
+                    category='Uploaded',
+                    title=filename,
+                    required=False,
+                    status='Received',
+                    file_path=dest,
+                )
+                session.add(dr)
+                session.add(AuditLog(
+                    case_id=case_id,
+                    action='DOCUMENT_UPLOAD',
+                    entity='DocumentRequirement',
+                    details=f'{code}:{filename}'
+                ))
                 session.commit()
         return {'ok': True, 'path': dest}
+
+
+@app.post('/api/documents/upload')
+def upload_document_alias(
+    case_id: int = Form(...),
+    file: UploadFile = File(...),
+    document_type: Optional[str] = Form(None),
+    code: Optional[str] = Form(None),
+):
+    return upload_document(case_id=case_id, file=file, code=code or document_type)
+
+
+@app.post('/api/cases/{case_id}/documents/{doc_code}/reuse')
+def reuse_document_from_other_year(case_id: int, doc_code: str):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        target_doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not target_doc:
+            raise HTTPException(status_code=404, detail='Document requirement not found')
+        if not _is_doc_reusable_across_years(doc_code):
+            raise HTTPException(status_code=400, detail='This document should be collected year-wise and is not reusable across years')
+
+        source_case = session.scalar(
+            select(TaxCase).where(
+                TaxCase.taxpayer_id == case.taxpayer_id,
+                TaxCase.id != case_id,
+            ).order_by(TaxCase.assessment_year.desc())
+        )
+        if not source_case:
+            raise HTTPException(status_code=404, detail='No prior tax year case found for this taxpayer')
+        source_doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == source_case.id,
+                DocumentRequirement.code == doc_code,
+                DocumentRequirement.file_path.is_not(None),
+            )
+        )
+        if not source_doc:
+            raise HTTPException(status_code=404, detail='No uploaded document found in prior years for this document code')
+
+        target_doc.file_path = source_doc.file_path
+        target_doc.status = 'Received'
+        target_doc.notes = f"Linked from AY {source_case.assessment_year} case {source_case.id}"
+        session.add(target_doc)
+        session.add(AuditLog(
+            case_id=case_id,
+            action='DOCUMENT_REUSED',
+            entity='DocumentRequirement',
+            details=f'{doc_code} linked from case {source_case.id}',
+        ))
+        session.commit()
+        return {'ok': True, 'linked_from_case_id': source_case.id, 'path': target_doc.file_path}
+
+
+@app.get('/api/taxpayers/{taxpayer_id}/documents/vault')
+def taxpayer_document_vault(taxpayer_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        cases = session.scalars(select(TaxCase).where(TaxCase.taxpayer_id == taxpayer_id)).all()
+        case_by_id = {c.id: c for c in cases}
+        if not cases:
+            return {'ok': True, 'documents': []}
+        docs = session.scalars(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id.in_(list(case_by_id.keys())),
+                DocumentRequirement.file_path.is_not(None),
+            )
+        ).all()
+        return {
+            'ok': True,
+            'documents': [
+                {
+                    'id': d.id,
+                    'code': d.code,
+                    'title': d.title,
+                    'status': d.status,
+                    'file_path': d.file_path,
+                    'case_id': d.case_id,
+                    'assessment_year': case_by_id[d.case_id].assessment_year if d.case_id in case_by_id else None,
+                    'financial_year': case_by_id[d.case_id].financial_year if d.case_id in case_by_id else None,
+                    'reusable_across_years': _is_doc_reusable_across_years(d.code),
+                }
+                for d in docs
+            ],
+        }
+
+
+@app.get('/api/cases/{case_id}/progress')
+def get_case_progress(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        return {'ok': True, 'progress': _case_progress(session, case_id)}
+
+
+@app.get('/api/cases/{case_id}/review-checks')
+def get_case_review_checks(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        return {'ok': True, 'checks': _review_checks(session, case)}
+
+
+@app.get('/api/cases/{case_id}/reconciliation')
+def get_case_reconciliation(case_id: int):
+    return get_reconciliation(case_id)
+
+
+@app.get('/api/cases/{case_id}/calculations/summary')
+def get_case_calculation_summary(case_id: int):
+    report = get_calculation_report(case_id)
+    if isinstance(report, dict) and report.get('ok'):
+        calc = report['report'].get('tax_calculation', {})
+        income = report['report'].get('income_summary', {})
+        return {
+            'ok': True,
+            'summary': {
+                'total_income': income.get('gross_income', 0),
+                'total_deductions': report['report'].get('deductions', {}).get('total', 0),
+                'taxable_income': calc.get('taxable_income', 0),
+                'income_tax': calc.get('tax_liability', 0),
+                'total_tds': calc.get('tds_deducted', 0),
+                'balance_due': calc.get('net_tax_payable', calc.get('refund', 0)),
+                'income_breakdown': {d.get('head'): d.get('amount', 0) for d in income.get('income_details', []) if d.get('head')},
+            },
+        }
+    return report
+
+
+@app.get('/api/calculations/case/{case_id}/summary')
+def get_case_calculation_summary_alias(case_id: int):
+    return get_case_calculation_summary(case_id)
+
+
+@app.get('/api/cases/{case_id}/residency')
+def get_residency(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        record = session.scalar(select(ResidencyRecord).where(ResidencyRecord.case_id == case_id))
+        return {
+            'ok': True,
+            'residency': None if not record else {
+                'id': record.id,
+                'days_in_india_current_fy': record.days_in_india_current_fy,
+                'days_in_india_prior_4y': record.days_in_india_prior_4y,
+                'days_in_india_prior_7y': record.days_in_india_prior_7y,
+                'nonresident_years_prior_10y': record.nonresident_years_prior_10y,
+                'date_returned_to_india': record.date_returned_to_india.isoformat() if record.date_returned_to_india else None,
+                'foreign_income_received_in_india': record.foreign_income_received_in_india,
+                'business_controlled_from_india': record.business_controlled_from_india,
+                'conclusion': record.conclusion,
+                'reviewed_by': record.reviewed_by,
+                'notes': record.notes,
+            },
+            'case_status': case.residential_status,
+        }
+
+
+@app.post('/api/cases/{case_id}/residency')
+def save_residency(case_id: int, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        record = session.scalar(select(ResidencyRecord).where(ResidencyRecord.case_id == case_id))
+        if not record:
+            record = ResidencyRecord(case_id=case_id)
+        for key in [
+            'days_in_india_current_fy',
+            'days_in_india_prior_4y',
+            'days_in_india_prior_7y',
+            'nonresident_years_prior_10y',
+            'foreign_income_received_in_india',
+            'business_controlled_from_india',
+            'conclusion',
+            'reviewed_by',
+            'notes',
+        ]:
+            if key in data:
+                setattr(record, key, data[key])
+        if 'date_returned_to_india' in data:
+            value = data['date_returned_to_india']
+            record.date_returned_to_india = None if not value else datetime.strptime(value, '%Y-%m-%d').date()
+        session.add(record)
+        session.commit()
+        return {'ok': True}
+
+
+@app.get('/api/cases/{case_id}/tax-credits')
+def list_tax_credits(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        rows = session.scalars(select(TaxCredit).where(TaxCredit.case_id == case_id)).all()
+        return {
+            'ok': True,
+            'credits': [
+                {
+                    'id': r.id,
+                    'deductor': r.deductor,
+                    'credit_type': r.credit_type,
+                    'section_code': r.section_code,
+                    'gross_amount_26as': float(r.gross_amount_26as),
+                    'tax_amount_26as': float(r.tax_amount_26as),
+                    'tax_claimed': float(r.tax_claimed),
+                    'notes': r.notes,
+                }
+                for r in rows
+            ]
+        }
+
+
+@app.post('/api/cases/{case_id}/tax-credits')
+def add_tax_credit(case_id: int, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        credit = TaxCredit(
+            case_id=case_id,
+            deductor=data.get('deductor', ''),
+            credit_type=data.get('credit_type', 'TDS'),
+            section_code=data.get('section_code'),
+            gross_amount_26as=data.get('gross_amount_26as', 0),
+            tax_amount_26as=data.get('tax_amount_26as', 0),
+            tax_claimed=data.get('tax_claimed', 0),
+            notes=data.get('notes'),
+        )
+        session.add(credit)
+        session.commit()
+        return {'ok': True, 'id': credit.id}
+
+
+@app.get('/api/cases/{case_id}/tasks')
+def list_tasks(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        suggestions = _task_status_suggestions(session, case)
+        rows = session.scalars(select(Task).where(Task.case_id == case_id)).all()
+        return {
+            'ok': True,
+            'auto_suggestions': True,
+            'tasks': [
+                {
+                    'id': r.id,
+                    'code': r.code,
+                    'phase': r.phase,
+                    'title': r.title,
+                    'status': r.status,
+                    'suggested_status': suggestions.get(r.code),
+                    'blocking': r.blocking,
+                    'notes': r.notes,
+                }
+                for r in rows
+            ]
+        }
+
+
+@app.put('/api/cases/{case_id}/tasks/{task_id}')
+def update_task(case_id: int, task_id: int, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        task = session.get(Task, task_id)
+        if not task or task.case_id != case_id:
+            raise HTTPException(status_code=404, detail='Task not found')
+        if 'status' in data:
+            task.status = data['status']
+        if 'notes' in data:
+            task.notes = data['notes']
+        session.add(task)
+        session.commit()
+        return {'ok': True}
+
+
+@app.post('/api/cases/{case_id}/tasks/reset')
+def reset_tasks(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        tasks = session.scalars(select(Task).where(Task.case_id == case_id)).all()
+        for task in tasks:
+            task.status = 'Not started'
+            session.add(task)
+        session.commit()
+        return {'ok': True, 'updated': len(tasks)}
+
+
+@app.get('/api/cases/{case_id}/audit-history')
+def audit_history(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        rows = session.scalars(
+            select(AuditLog).where(AuditLog.case_id == case_id).order_by(AuditLog.event_time.desc())
+        ).all()
+        return {
+            'ok': True,
+            'history': [
+                {
+                    'id': r.id,
+                    'event_time': r.event_time.isoformat() if r.event_time else None,
+                    'action': r.action,
+                    'entity': r.entity,
+                    'details': r.details,
+                }
+                for r in rows
+            ],
+        }
+
+
+@app.get('/api/cases/{case_id}/properties')
+def list_properties(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        rows = session.scalars(select(PropertyLoan).where(PropertyLoan.case_id == case_id)).all()
+        return {
+            'ok': True,
+            'properties': [
+                {
+                    'id': r.id,
+                    'property_name': r.property_name,
+                    'property_address': r.property_address,
+                    'ownership_percent': float(r.ownership_percent),
+                    'self_occupied': r.self_occupied,
+                    'possession_date': r.possession_date.isoformat() if r.possession_date else None,
+                    'loan_start_date': r.loan_start_date.isoformat() if r.loan_start_date else None,
+                    'lender': r.lender,
+                    'interest_fy': float(r.interest_fy),
+                    'principal_fy': float(r.principal_fy),
+                    'preconstruction_interest': float(r.preconstruction_interest),
+                    'actual_payment_percent': float(r.actual_payment_percent),
+                    'notes': r.notes,
+                }
+                for r in rows
+            ],
+        }
+
+
+@app.post('/api/cases/{case_id}/properties')
+def add_property(case_id: int, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        prop = PropertyLoan(
+            case_id=case_id,
+            property_name=data.get('property_name', ''),
+            property_address=data.get('property_address'),
+            ownership_percent=data.get('ownership_percent', 0),
+            self_occupied=bool(data.get('self_occupied', True)),
+            lender=data.get('lender'),
+            interest_fy=data.get('interest_fy', 0),
+            principal_fy=data.get('principal_fy', 0),
+            preconstruction_interest=data.get('preconstruction_interest', 0),
+            actual_payment_percent=data.get('actual_payment_percent', 0),
+            notes=data.get('notes'),
+        )
+        if data.get('possession_date'):
+            prop.possession_date = datetime.strptime(data['possession_date'], '%Y-%m-%d').date()
+        if data.get('loan_start_date'):
+            prop.loan_start_date = datetime.strptime(data['loan_start_date'], '%Y-%m-%d').date()
+        session.add(prop)
+        session.commit()
+        return {'ok': True, 'id': prop.id}
+
+
+@app.put('/api/cases/{case_id}/properties/{property_id}')
+def update_property(case_id: int, property_id: int, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        prop = session.get(PropertyLoan, property_id)
+        if not prop or prop.case_id != case_id:
+            raise HTTPException(status_code=404, detail='Property not found')
+
+        for field in [
+            'property_name', 'property_address', 'ownership_percent', 'self_occupied', 'lender',
+            'interest_fy', 'principal_fy', 'preconstruction_interest', 'actual_payment_percent', 'notes'
+        ]:
+            if field in data:
+                setattr(prop, field, data[field])
+
+        if 'possession_date' in data:
+            value = data.get('possession_date')
+            prop.possession_date = None if not value else datetime.strptime(value, '%Y-%m-%d').date()
+        if 'loan_start_date' in data:
+            value = data.get('loan_start_date')
+            prop.loan_start_date = None if not value else datetime.strptime(value, '%Y-%m-%d').date()
+
+        session.add(prop)
+        session.commit()
+        return {'ok': True}
+
+
+@app.get('/api/portal/export')
+def export_case_bundle(case_id: int, format: str = 'json'):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        payload = get_calculation_report(case_id)
+        if format == 'xml':
+            content = f'<itr case_id="{case_id}" assessment_year="{case.assessment_year}" />'
+            return Response(content=content, media_type='application/xml')
+        if format == 'csv':
+            report = payload.get('report', {}) if isinstance(payload, dict) else {}
+            buffer = io.StringIO()
+            writer = csv.writer(buffer)
+            writer.writerow(['field', 'value'])
+            writer.writerow(['case_id', case_id])
+            writer.writerow(['assessment_year', report.get('assessment_year', case.assessment_year)])
+            writer.writerow(['taxpayer_name', report.get('taxpayer_details', {}).get('name', '')])
+            writer.writerow(['residential_status', report.get('taxpayer_details', {}).get('residential_status', case.residential_status)])
+            writer.writerow(['gross_income', report.get('income_summary', {}).get('gross_income', 0)])
+            writer.writerow(['taxable_income', report.get('tax_calculation', {}).get('taxable_income', 0)])
+            writer.writerow(['tax_liability', report.get('tax_calculation', {}).get('tax_liability', 0)])
+            writer.writerow(['tds_deducted', report.get('tax_calculation', {}).get('tds_deducted', 0)])
+            writer.writerow(['net_tax_payable', report.get('tax_calculation', {}).get('net_tax_payable', 0)])
+            return Response(content=buffer.getvalue(), media_type='text/csv')
+        return JSONResponse(content=payload)
 
 
 @app.post('/api/documents/parse')
@@ -681,11 +1684,101 @@ async def ai_chat(req: AIRequest):
 
 
 # ==================== PROFILE API ====================
+@app.get('/api/taxpayers/{taxpayer_id}/profile')
+def get_taxpayer_profile(taxpayer_id: int):
+    if not SessionLocal:
+       return {'error': 'Database not configured'}
+    session = SessionLocal()
+    try:
+       tp = session.query(Taxpayer).filter(Taxpayer.id == taxpayer_id).first()
+       if not tp:
+           raise HTTPException(status_code=404, detail='Taxpayer not found')
+       profile_row = session.execute(
+           text("""
+               SELECT mobile_primary, aadhaar_mobile, alt_mobiles, email, permanent_address,
+                      mailing_address, city, state, postal_code, country,
+                      date_of_birth, marital_status, occupation, employer_name,
+                      aadhaar_last4, passport_last4, emergency_contact_name, emergency_contact_mobile,
+                      refund_account_last4, refund_ifsc, preferred_contact_mode, communication_notes,
+                      pan_full, aadhaar_full, passport_full, mobile_country_code, aadhaar_mobile_country_code
+               FROM taxpayer_profiles
+               WHERE taxpayer_id = :taxpayer_id
+           """),
+           {'taxpayer_id': taxpayer_id}
+       ).mappings().first()
+       profile = dict(profile_row) if profile_row else {
+           'mobile_primary': None,
+           'aadhaar_mobile': None,
+           'alt_mobiles': None,
+           'email': getattr(tp, 'email', None),
+           'permanent_address': None,
+           'mailing_address': None,
+           'city': None,
+           'state': None,
+           'postal_code': None,
+           'country': 'India',
+           'date_of_birth': None,
+           'marital_status': None,
+           'occupation': None,
+           'employer_name': None,
+           'aadhaar_last4': None,
+           'passport_last4': None,
+           'emergency_contact_name': None,
+           'emergency_contact_mobile': None,
+           'refund_account_last4': None,
+           'refund_ifsc': None,
+           'preferred_contact_mode': 'email',
+           'communication_notes': None,
+           'pan_full': None,
+           'aadhaar_full': None,
+           'passport_full': None,
+           'mobile_country_code': '+91',
+           'aadhaar_mobile_country_code': '+91',
+       }
+       profile['email'] = profile.get('email') or getattr(tp, 'email', None)
+       if profile.get('date_of_birth'):
+           profile['date_of_birth'] = profile['date_of_birth'].isoformat()
+       return {
+           'ok': True,
+           'taxpayer': {
+               'id': tp.id,
+               'name': tp.name,
+               'citizenship': tp.citizenship,
+               'pan_last4': tp.pan_last4,
+               'has_dependent_child': tp.has_dependent_child,
+               'dependent_child_country_of_residence': tp.dependent_child_country_of_residence,
+           },
+           'profile': profile,
+       }
+    finally:
+       session.close()
+
+
 @app.put('/api/taxpayers/{taxpayer_id}')
 def update_taxpayer(taxpayer_id: int, data: Dict[str, Any]):
     """Update taxpayer profile information"""
     if not SessionLocal:
        return {'error': 'Database not configured'}
+
+    def _none_if_blank(value):
+        if value is None:
+            return None
+        if isinstance(value, str) and value.strip() == '':
+            return None
+        return value
+
+    def _alnum_upper(value):
+        value = _none_if_blank(value)
+        if value is None:
+            return None
+        return ''.join(ch for ch in str(value).upper() if ch.isalnum())
+
+    def _digits_only(value):
+        value = _none_if_blank(value)
+        if value is None:
+            return None
+        digits = ''.join(ch for ch in str(value) if ch.isdigit())
+        return digits or None
     
     session = SessionLocal()
     try:
@@ -693,18 +1786,115 @@ def update_taxpayer(taxpayer_id: int, data: Dict[str, Any]):
        if not tp:
            raise HTTPException(status_code=404, detail='Taxpayer not found')
         
+       # Normalize core identity fields first so last4 can be derived automatically.
+       pan_full = _alnum_upper(data.get('pan_full'))
+       aadhaar_full = _digits_only(data.get('aadhaar_full'))
+       passport_full = _alnum_upper(data.get('passport_full'))
+       pan_last4 = pan_full[-4:] if pan_full and len(pan_full) >= 4 else _alnum_upper(data.get('pan_last4'))
+       aadhaar_last4 = aadhaar_full[-4:] if aadhaar_full and len(aadhaar_full) >= 4 else _digits_only(data.get('aadhaar_last4'))
+       passport_last4 = passport_full[-4:] if passport_full and len(passport_full) >= 4 else _alnum_upper(data.get('passport_last4'))
+
        # Update fields
-       if 'name' in data:
-           tp.name = data['name']
-       if 'citizenship' in data:
-           tp.citizenship = data['citizenship']
-       if 'pan_last4' in data:
-           tp.pan_last4 = data['pan_last4']
+       if 'name' in data and _none_if_blank(data['name']):
+          tp.name = str(data['name']).strip()
+       if 'citizenship' in data and _none_if_blank(data['citizenship']):
+          tp.citizenship = str(data['citizenship']).strip()
+       if pan_last4 is not None or 'pan_last4' in data or 'pan_full' in data:
+          tp.pan_last4 = pan_last4
        if 'has_dependent_child' in data:
-           tp.has_dependent_child = data['has_dependent_child']
+          tp.has_dependent_child = data['has_dependent_child']
        if 'dependent_child_country_of_residence' in data:
-           tp.dependent_child_country_of_residence = data['dependent_child_country_of_residence']
-        
+          tp.dependent_child_country_of_residence = data['dependent_child_country_of_residence']
+       if 'email' in data:
+          tp.email = _none_if_blank(data['email'])
+
+       dob_value = _none_if_blank(data.get('date_of_birth'))
+       parsed_dob = None
+       if dob_value is not None:
+          if isinstance(dob_value, str):
+              parsed_dob = datetime.strptime(dob_value, '%Y-%m-%d').date()
+          else:
+              parsed_dob = dob_value
+
+       session.execute(
+           text("""
+               INSERT INTO taxpayer_profiles (
+                   taxpayer_id, mobile_primary, aadhaar_mobile, alt_mobiles, email,
+                   permanent_address, mailing_address, city, state, postal_code, country,
+                   date_of_birth, marital_status, occupation, employer_name,
+                   aadhaar_last4, passport_last4, emergency_contact_name, emergency_contact_mobile,
+                   refund_account_last4, refund_ifsc, preferred_contact_mode, communication_notes,
+                   pan_full, aadhaar_full, passport_full, mobile_country_code, aadhaar_mobile_country_code, updated_at
+               ) VALUES (
+                   :taxpayer_id, :mobile_primary, :aadhaar_mobile, :alt_mobiles, :email,
+                   :permanent_address, :mailing_address, :city, :state, :postal_code, :country,
+                   :date_of_birth, :marital_status, :occupation, :employer_name,
+                   :aadhaar_last4, :passport_last4, :emergency_contact_name, :emergency_contact_mobile,
+                   :refund_account_last4, :refund_ifsc, :preferred_contact_mode, :communication_notes,
+                   :pan_full, :aadhaar_full, :passport_full, :mobile_country_code, :aadhaar_mobile_country_code, NOW()
+               )
+               ON CONFLICT (taxpayer_id) DO UPDATE SET
+                   mobile_primary = EXCLUDED.mobile_primary,
+                   aadhaar_mobile = EXCLUDED.aadhaar_mobile,
+                   alt_mobiles = EXCLUDED.alt_mobiles,
+                   email = EXCLUDED.email,
+                   permanent_address = EXCLUDED.permanent_address,
+                   mailing_address = EXCLUDED.mailing_address,
+                   city = EXCLUDED.city,
+                   state = EXCLUDED.state,
+                   postal_code = EXCLUDED.postal_code,
+                   country = EXCLUDED.country,
+                   date_of_birth = EXCLUDED.date_of_birth,
+                   marital_status = EXCLUDED.marital_status,
+                   occupation = EXCLUDED.occupation,
+                   employer_name = EXCLUDED.employer_name,
+                   aadhaar_last4 = EXCLUDED.aadhaar_last4,
+                   passport_last4 = EXCLUDED.passport_last4,
+                   emergency_contact_name = EXCLUDED.emergency_contact_name,
+                   emergency_contact_mobile = EXCLUDED.emergency_contact_mobile,
+                   refund_account_last4 = EXCLUDED.refund_account_last4,
+                   refund_ifsc = EXCLUDED.refund_ifsc,
+                   preferred_contact_mode = EXCLUDED.preferred_contact_mode,
+                   communication_notes = EXCLUDED.communication_notes,
+                   pan_full = EXCLUDED.pan_full,
+                   aadhaar_full = EXCLUDED.aadhaar_full,
+                   passport_full = EXCLUDED.passport_full,
+                   mobile_country_code = EXCLUDED.mobile_country_code,
+                   aadhaar_mobile_country_code = EXCLUDED.aadhaar_mobile_country_code,
+                   updated_at = NOW()
+           """),
+           {
+               'taxpayer_id': taxpayer_id,
+               'mobile_primary': _none_if_blank(data.get('mobile_primary')),
+               'aadhaar_mobile': _none_if_blank(data.get('aadhaar_mobile')),
+               'alt_mobiles': _none_if_blank(data.get('alt_mobiles')),
+               'email': _none_if_blank(data.get('email')),
+               'permanent_address': _none_if_blank(data.get('permanent_address')),
+               'mailing_address': _none_if_blank(data.get('mailing_address')),
+               'city': _none_if_blank(data.get('city')),
+               'state': _none_if_blank(data.get('state')),
+               'postal_code': _none_if_blank(data.get('postal_code')),
+               'country': _none_if_blank(data.get('country')) or 'India',
+               'date_of_birth': parsed_dob,
+               'marital_status': _none_if_blank(data.get('marital_status')),
+               'occupation': _none_if_blank(data.get('occupation')),
+               'employer_name': _none_if_blank(data.get('employer_name')),
+               'aadhaar_last4': aadhaar_last4,
+               'passport_last4': passport_last4,
+               'emergency_contact_name': _none_if_blank(data.get('emergency_contact_name')),
+               'emergency_contact_mobile': _none_if_blank(data.get('emergency_contact_mobile')),
+               'refund_account_last4': _none_if_blank(data.get('refund_account_last4')),
+               'refund_ifsc': _none_if_blank(data.get('refund_ifsc')),
+               'preferred_contact_mode': _none_if_blank(data.get('preferred_contact_mode')) or 'email',
+               'communication_notes': _none_if_blank(data.get('communication_notes')),
+               'pan_full': pan_full,
+               'aadhaar_full': aadhaar_full,
+               'passport_full': passport_full,
+               'mobile_country_code': _none_if_blank(data.get('mobile_country_code')) or '+91',
+               'aadhaar_mobile_country_code': _none_if_blank(data.get('aadhaar_mobile_country_code')) or '+91',
+           }
+       )
+         
        session.commit()
        return {'ok': True, 'taxpayer': {
            'id': tp.id,
@@ -712,6 +1902,7 @@ def update_taxpayer(taxpayer_id: int, data: Dict[str, Any]):
            'citizenship': tp.citizenship,
            'pan_last4': tp.pan_last4,
            'has_dependent_child': tp.has_dependent_child,
+           'email': tp.email,
        }}
     except Exception as e:
        session.rollback()
@@ -835,13 +2026,11 @@ def get_reconciliation(case_id: int):
         
        tp = case.taxpayer
         
-       # Calculate ITR amount
-       calc = _build_calc_from_person(tp)
+       # Calculate ITR amount from real entries
        filing_result = calculate_filing(tp)
         
        itr_amount = float(filing_result.get('tax_liability', 0)) if isinstance(filing_result, dict) else 0
         
-       # Get TDS from documents/entries
        tds_total = 0
        if hasattr(case, 'income_entries'):
            for ie in case.income_entries:
@@ -853,19 +2042,31 @@ def get_reconciliation(case_id: int):
            for ie in case.income_entries:
                gross_income += float(getattr(ie, 'gross_amount', 0) or 0)
         
+       rec_items = session.scalars(select(ReconciliationItem).where(ReconciliationItem.case_id == case_id)).all()
+       source_total = sum(float(getattr(r, 'source_amount', 0) or 0) for r in rec_items) if rec_items else None
+       ais_reported = sum(float(getattr(r, 'ais_26as_amount', 0) or 0) for r in rec_items) if rec_items else None
+       itr_reported = sum(float(getattr(r, 'return_amount', 0) or 0) for r in rec_items) if rec_items else None
+       status = 'pending_input'
+       variances = {'source_vs_ais': None, 'ais_vs_itr': None}
+       if rec_items:
+           variances = {
+               'source_vs_ais': float(source_total or 0) - float(ais_reported or 0),
+               'ais_vs_itr': float(ais_reported or 0) - float(itr_reported or 0),
+           }
+           status = 'matched' if abs(variances['source_vs_ais']) < 100 and abs(variances['ais_vs_itr']) < 100 else 'flagged'
+
        return {
            'ok': True,
            'case_id': case_id,
            'reconciliation': {
-               'source_total': gross_income,  # From user entries
-               'ais_reported': gross_income,  # Placeholder: should fetch from AIS upload
-               'form26as_tds': tds_total,     # From Form 26AS/TDS entries
+               'source_total': source_total,
+               'ais_reported': ais_reported,
+               'itr_amount': itr_reported,
+               'income_from_entries': gross_income,
+               'form26as_tds': tds_total,
                'calculated_tax': itr_amount,
-               'variances': {
-                   'source_vs_ais': 0,  # Placeholder
-                   'ais_vs_itr': 0,     # Placeholder
-               },
-               'status': 'matched' if abs(gross_income - gross_income) < 100 else 'flagged',
+               'variances': variances,
+               'status': status,
            }
        }
     finally:
@@ -1084,7 +2285,9 @@ def household_members():
                        {
                            'id': c.id,
                            'assessment_year': c.assessment_year,
+                           'financial_year': c.financial_year,
                            'residential_status': c.residential_status,
+                           'case_status': c.case_status,
                        }
                        for c in cases if c
                    ]
@@ -1095,6 +2298,85 @@ def household_members():
        except Exception as e:
            logger.error(f"Error fetching household members: {e}")
            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/api/taxpayers/{taxpayer_id}/cases')
+def create_or_get_case_for_year(taxpayer_id: int, data: Dict[str, Any]):
+    """Create a case for a selected AY/FY (or return existing one)."""
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    assessment_year = str(data.get('assessment_year') or '').strip()
+    financial_year = str(data.get('financial_year') or '').strip()
+    residential_status = str(data.get('residential_status') or '').strip() or 'NRI'
+    return_form = str(data.get('return_form') or '').strip() or 'ITR-2'
+    if not assessment_year:
+        raise HTTPException(status_code=400, detail='assessment_year is required')
+    if not financial_year:
+        try:
+           start = int(assessment_year.split('-')[0]) - 1
+           financial_year = f"{start}-{str(start + 1)[-2:]}"
+        except Exception:
+           raise HTTPException(status_code=400, detail='financial_year is required or assessment_year must be valid AY format (e.g. 2026-27)')
+
+    with SessionLocal() as session:
+        tp = session.get(Taxpayer, taxpayer_id)
+        if not tp:
+           raise HTTPException(status_code=404, detail='Taxpayer not found')
+        existing = session.scalar(select(TaxCase).where(TaxCase.taxpayer_id == taxpayer_id, TaxCase.assessment_year == assessment_year))
+        if existing:
+           return {'ok': True, 'created': False, 'case': {'id': existing.id, 'assessment_year': existing.assessment_year, 'financial_year': existing.financial_year}}
+
+        latest_case = session.scalar(
+           select(TaxCase)
+           .where(TaxCase.taxpayer_id == taxpayer_id)
+           .order_by(TaxCase.created_at.desc())
+        )
+        new_case = TaxCase(
+           taxpayer_id=taxpayer_id,
+           assessment_year=assessment_year,
+           financial_year=financial_year,
+           residential_status=latest_case.residential_status if latest_case else residential_status,
+           return_form=latest_case.return_form if latest_case else return_form,
+           tax_regime=latest_case.tax_regime if latest_case else 'Undecided',
+           case_status='Collecting',
+        )
+        session.add(new_case)
+        session.flush()
+        session.add(ResidencyRecord(case_id=new_case.id, conclusion=new_case.residential_status))
+
+        if latest_case:
+           template_docs = session.scalars(select(DocumentRequirement).where(DocumentRequirement.case_id == latest_case.id)).all()
+           for d in template_docs:
+               session.add(DocumentRequirement(
+                   case_id=new_case.id,
+                   code=d.code,
+                   category=d.category,
+                   title=d.title,
+                   institution=d.institution,
+                   required=d.required,
+                   status='Missing',
+                   source_period=d.source_period,
+                   notes=None,
+               ))
+           template_tasks = session.scalars(select(Task).where(Task.case_id == latest_case.id)).all()
+           for t in template_tasks:
+               session.add(Task(
+                   case_id=new_case.id,
+                   code=t.code,
+                   phase=t.phase,
+                   title=t.title,
+                   status='Not started',
+                   blocking=t.blocking,
+                   notes=None,
+               ))
+        session.add(AuditLog(
+           case_id=new_case.id,
+           action='CASE_CREATED',
+           entity='TaxCase',
+           details=f'Created case for AY {assessment_year}, FY {financial_year}',
+        ))
+        session.commit()
+        return {'ok': True, 'created': True, 'case': {'id': new_case.id, 'assessment_year': new_case.assessment_year, 'financial_year': new_case.financial_year}}
 
 
 @app.get('/api/household/summary')
@@ -1308,3 +2590,23 @@ def compare_cases(case_id: int, other_case_id: int):
            raise HTTPException(status_code=500, detail=str(e))
 
 
+
+# ============================================================================
+# PHASE 3: ADVANCED AI SPECIALISTS INTEGRATION
+# ============================================================================
+
+try:
+    from .phase3_endpoints import router as phase3_router
+    app.include_router(phase3_router)
+except Exception as e:
+    logger.warning(f"Phase 3 endpoints not available: {e}")
+
+# ============================================================================
+# PHASE 4: PORTAL INTEGRATION
+# ============================================================================
+
+try:
+    from .portal_endpoints import router as portal_router
+    app.include_router(portal_router)
+except Exception as e:
+    logger.warning(f"Portal integration endpoints not available: {e}")
