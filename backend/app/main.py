@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
-from fastapi.responses import JSONResponse, Response
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.responses import JSONResponse, Response, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, Dict, Optional, List
@@ -7,7 +7,8 @@ from decimal import Decimal
 import os
 import csv
 import io
-from datetime import datetime
+import mimetypes
+from datetime import datetime, date, timedelta
 import requests
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, select, text
@@ -44,6 +45,7 @@ try:
         Taxpayer,
         TaxCase,
         DocumentRequirement,
+        DocumentEvidence,
         ResidencyRecord,
         TaxCredit,
         PropertyLoan,
@@ -64,6 +66,7 @@ except Exception as e:
     Taxpayer = None
     TaxCase = None
     DocumentRequirement = None
+    DocumentEvidence = None
     ResidencyRecord = None
     TaxCredit = None
     PropertyLoan = None
@@ -133,6 +136,355 @@ def _review_checks(session, case) -> list[dict]:
 
 def _is_doc_reusable_across_years(code: str) -> bool:
     return bool(code and (code.startswith(COMMON_DOC_PREFIXES) or code.endswith("_DEED") or code.endswith("_PASSPORT")))
+
+
+def _looks_like_filename(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    lowered = value.strip().lower()
+    return any(lowered.endswith(ext) for ext in (".pdf", ".png", ".jpg", ".jpeg", ".csv", ".json", ".xlsx", ".xls", ".zip"))
+
+
+def _checklist_display_title(doc) -> str:
+    raw = (doc.title or "").strip()
+    if raw and not _looks_like_filename(raw):
+        return raw
+    code = (doc.code or "DOCUMENT").strip()
+    institution = (doc.institution or "").strip()
+    if institution:
+        return f"{institution} - {code}"
+    return code.replace("_", " ").title()
+
+
+def _parse_not_applicable_reason(notes: Optional[str]) -> Optional[str]:
+    text_value = (notes or "").strip()
+    prefix = "Not applicable:"
+    if text_value.lower().startswith(prefix.lower()):
+        return text_value[len(prefix):].strip() or None
+    return None
+
+
+def _to_amount(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float, Decimal)):
+        return float(value)
+    text_value = str(value).replace(",", "").replace("₹", "").strip()
+    if not text_value:
+        return 0.0
+    try:
+        return float(text_value)
+    except ValueError:
+        return 0.0
+
+
+def _deduplicate_draft_entries(entries: List[Dict]) -> List[Dict]:
+    """
+    Detect entries representing the same underlying income from different sources.
+
+    Duplicate = same income_type + gross_amount within 0.5% + tds_amount within 0.5%.
+
+    Source preference (lower rank = kept as primary):
+      0 → Specific bank interest certificate (cert, NRE, NRO in source name)
+      5 → Zerodha / MF dividend report
+     10 → Combined or generic certificate
+     20 → Form 26AS (authoritative for TDS, but secondary for gross income)
+
+    Duplicate entries get:  is_duplicate=True, selected=False, duplicate_of=<primary source name>
+    Primary entries get:    is_duplicate=False, selected=True
+    """
+
+    def _amounts_close(a: float, b: float) -> bool:
+        if a == b:
+            return True
+        if max(abs(a), abs(b)) < 0.01:
+            return True
+        return abs(a - b) / max(abs(a), abs(b)) < 0.005
+
+    def _source_rank(entry: Dict) -> int:
+        src = (entry.get('source_name') or '').lower()
+        code = (entry.get('doc_code') or '').upper()
+        if '26as' in src:
+            return 20
+        if 'combined' in src or 'cum' in src:
+            return 10
+        if 'zerodha' in src or 'dividend' in src or code == 'ZERODHA_DIV':
+            return 5
+        return 0  # Specific interest cert — most preferred
+
+    for i, e in enumerate(entries):
+        e.setdefault('is_duplicate', False)
+        e.setdefault('duplicate_of', None)
+        e.setdefault('duplicate_group', None)
+        e.setdefault('selected', True)
+
+    n = len(entries)
+    processed = set()
+    group_counter = 0
+
+    for i in range(n):
+        if i in processed:
+            continue
+        ei = entries[i]
+        group = [i]
+
+        for j in range(i + 1, n):
+            ej = entries[j]
+            if (ei['income_type'] == ej['income_type']
+                    and _amounts_close(ei['gross_amount'], ej['gross_amount'])
+                    and _amounts_close(ei['tds_amount'], ej['tds_amount'])
+                    and ei['gross_amount'] > 0):
+                group.append(j)
+                processed.add(j)
+
+        if len(group) > 1:
+            group_counter += 1
+            gid = f"DG{group_counter}"
+            group.sort(key=lambda idx: _source_rank(entries[idx]))
+            preferred_idx = group[0]
+
+            for idx in group:
+                entries[idx]['duplicate_group'] = gid
+                if idx == preferred_idx:
+                    entries[idx]['is_duplicate'] = False
+                    entries[idx]['selected'] = True
+                else:
+                    entries[idx]['is_duplicate'] = True
+                    entries[idx]['selected'] = False
+                    entries[idx]['duplicate_of'] = entries[preferred_idx]['source_name']
+
+    return entries
+
+
+def _doc_type_for_code(doc_code: str) -> Optional[str]:
+    """Map document checklist code to parser DocumentType string."""
+    code = (doc_code or "").upper()
+    if code == "PORTAL_AIS":
+        return "AIS"
+    if code == "PORTAL_26AS":
+        return "FORM_26AS"
+    # Bank interest / TDS certificates → dedicated interest parser
+    # LOAN_CERT is excluded — it's a home-loan deduction doc, not income
+    if code.endswith("_INT"):
+        return "INTEREST_CERTIFICATE"
+    if code == "ZERODHA_DIV":
+        return "DIV_REPORT"
+    if code in {"ZERODHA_TAXPL", "MF_CG"}:
+        return "CAS"
+    return None
+
+
+def _map_income_type(label: str) -> str:
+    text_value = (label or "").strip().lower()
+    if "salary" in text_value and "foreign" in text_value:
+        return "salary_foreign"
+    if "salary" in text_value:
+        return "salary_india"
+    if "interest" in text_value:
+        return "interest_other"
+    if "dividend" in text_value:
+        return "dividend"
+    if "rent" in text_value:
+        return "rental"
+    if "professional" in text_value:
+        return "professional"
+    if "capital" in text_value or "gain" in text_value:
+        return "cg_long"
+    return "other"
+
+
+def _build_income_drafts_from_parse(doc, parse_result: Dict[str, Any], evidence_id: Optional[int]) -> List[Dict[str, Any]]:
+    drafts: List[Dict[str, Any]] = []
+    data = parse_result.get("extracted_data") or {}
+    doc_type = (parse_result.get("document_type") or "").lower()
+    source_label = _checklist_display_title(doc)
+
+    if doc_type == "ais":
+        for section in (data.get("sections") or []):
+            section_name = section.get("section") or "Other"
+            amount = _to_amount(section.get("amount"))
+            income_type = section.get("income_type") or _map_income_type(section_name)
+            if amount <= 0:
+                continue
+            drafts.append({
+                "income_type": income_type,
+                "source_name": f"{source_label} – {section_name}",
+                "gross_amount": amount,
+                "tds_amount": 0.0,
+                "confidence": "medium",
+                "rationale": f"Extracted from AIS section: {section_name}.",
+                "doc_code": doc.code,
+                "evidence_id": evidence_id,
+            })
+
+    elif doc_type == "form_26as":
+        # tds_entries have: deductor, gross_amount, tds
+        for row in (data.get("tds_entries") or []):
+            gross = _to_amount(row.get("gross_amount") or row.get("amount"))
+            tds = _to_amount(row.get("tds") or row.get("tds_amount"))
+            if gross <= 0 and tds <= 0:
+                continue
+            deductor = row.get("deductor") or "TDS Deductor"
+            drafts.append({
+                "income_type": "interest_other",
+                "source_name": f"26AS – {deductor}",
+                "gross_amount": gross,
+                "tds_amount": tds,
+                "confidence": "high",
+                "rationale": "Extracted from Form 26AS PART-I TDS entry. Gross = total amount paid/credited by deductor.",
+                "doc_code": doc.code,
+                "evidence_id": evidence_id,
+            })
+
+    elif doc_type == "interest_certificate":
+        code_upper = (doc.code or "").upper()
+        is_nre_code = "NRE" in code_upper
+        is_nro_code = "NRO" in code_upper
+        is_combined = data.get("is_combined", False)
+
+        if is_combined and is_nre_code:
+            gross = _to_amount(data.get("nre_total_interest"))
+            tds = _to_amount(data.get("nre_total_tds"))
+            label_suffix = "NRE Interest (tax-exempt for NRI)"
+        elif is_combined and is_nro_code:
+            gross = _to_amount(data.get("nro_total_interest"))
+            tds = _to_amount(data.get("nro_total_tds"))
+            label_suffix = "NRO Interest"
+        elif data.get("is_nre"):
+            gross = _to_amount(data.get("total_interest"))
+            tds = _to_amount(data.get("total_tds"))
+            label_suffix = "NRE Interest (tax-exempt for NRI)"
+        else:
+            gross = _to_amount(data.get("total_interest"))
+            tds = _to_amount(data.get("total_tds"))
+            label_suffix = "NRO Interest"
+
+        if gross > 0 or tds > 0:
+            is_nre = "NRE" in label_suffix
+            drafts.append({
+                "income_type": "interest_other",
+                "source_name": f"{source_label} – {label_suffix}",
+                "gross_amount": gross,
+                "tds_amount": tds,
+                "confidence": "high",
+                "rationale": (
+                    "Extracted from interest/TDS certificate. "
+                    + ("NRE interest is exempt from Indian income tax for NRI." if is_nre
+                       else "NRO interest is taxable; TDS already deducted by bank.")
+                ),
+                "doc_code": doc.code,
+                "evidence_id": evidence_id,
+            })
+
+    elif doc_type == "dividend_report":
+        total_div = _to_amount(data.get("total_dividend"))
+        entries = data.get("entries") or []
+        n_stocks = len(set(e.get("symbol") for e in entries if e.get("symbol")))
+        if total_div > 0:
+            drafts.append({
+                "income_type": "dividend",
+                "source_name": f"{source_label} – Equity Dividends ({n_stocks} stocks)",
+                "gross_amount": total_div,
+                "tds_amount": 0.0,
+                "confidence": "high",
+                "rationale": (
+                    f"Extracted from Zerodha dividend report: {len(entries)} dividend credits, "
+                    f"{n_stocks} stocks, total ₹{total_div:,.2f}. "
+                    "TDS deducted by companies appears in Form 26AS — cross-check there."
+                ),
+                "doc_code": doc.code,
+                "evidence_id": evidence_id,
+            })
+
+    elif doc_type in {"bank_statement", "cas"}:
+        # Legacy path for statements incorrectly routed as bank_statement
+        raw_interest = _to_amount((data or {}).get("interest_amount"))
+        raw_tds = _to_amount((data or {}).get("tds_amount"))
+        if raw_interest > 0 or raw_tds > 0:
+            drafts.append({
+                "income_type": "interest_other",
+                "source_name": source_label,
+                "gross_amount": raw_interest,
+                "tds_amount": raw_tds,
+                "confidence": "low",
+                "rationale": "Heuristic read from statement. Verify values manually.",
+                "doc_code": doc.code,
+                "evidence_id": evidence_id,
+            })
+
+    return drafts
+
+
+def _load_evidences_for_requirements(session, requirement_ids: list[int]) -> Dict[int, list]:
+    if not requirement_ids or DocumentEvidence is None:
+        return {}
+    rows = session.scalars(
+        select(DocumentEvidence)
+        .where(DocumentEvidence.document_requirement_id.in_(requirement_ids))
+        .order_by(DocumentEvidence.is_primary.desc(), DocumentEvidence.created_at.asc(), DocumentEvidence.id.asc())
+    ).all()
+    grouped: Dict[int, list] = {}
+    for row in rows:
+        grouped.setdefault(row.document_requirement_id, []).append(row)
+    return grouped
+
+
+def _sync_requirement_from_evidences(requirement, evidences: list) -> None:
+    if not evidences:
+        requirement.file_path = None
+        requirement.status = "Missing" if requirement.required else "Not applicable"
+        requirement.notes = None
+        return
+
+    primary = next((e for e in evidences if e.is_primary), evidences[0])
+    for e in evidences:
+        e.is_primary = (e.id == primary.id)
+    requirement.file_path = primary.file_path
+    requirement.status = "Received"
+    requirement.notes = f"Primary source: {primary.title or os.path.basename(primary.file_path)}"
+
+
+def _add_document_evidence(
+    session,
+    requirement,
+    file_path: str,
+    title: Optional[str] = None,
+    source_document_requirement_id: Optional[int] = None,
+    make_primary: bool = False,
+):
+    existing = session.scalars(
+        select(DocumentEvidence).where(DocumentEvidence.document_requirement_id == requirement.id)
+    ).all() if DocumentEvidence is not None else []
+    duplicate = next((row for row in existing if row.file_path == file_path), None)
+    if duplicate:
+        if title:
+            duplicate.title = title
+        if make_primary:
+            for row in existing:
+                row.is_primary = (row.id == duplicate.id)
+                session.add(row)
+        _sync_requirement_from_evidences(requirement, existing)
+        session.add(requirement)
+        session.flush()
+        return duplicate
+    if make_primary:
+        for row in existing:
+            row.is_primary = False
+            session.add(row)
+    elif not existing:
+        make_primary = True
+    evidence = DocumentEvidence(
+        document_requirement_id=requirement.id,
+        title=title or os.path.basename(file_path),
+        file_path=file_path,
+        is_primary=make_primary,
+        source_document_requirement_id=source_document_requirement_id,
+    )
+    session.add(evidence)
+    session.flush()
+    _sync_requirement_from_evidences(requirement, existing + [evidence])
+    session.add(requirement)
+    return evidence
 
 
 def _task_status_suggestions(session, case) -> Dict[str, str]:
@@ -369,7 +721,152 @@ def _ensure_profile_table() -> None:
         conn.execute(text("ALTER TABLE taxpayer_profiles ADD COLUMN IF NOT EXISTS aadhaar_mobile_country_code VARCHAR(5)"))
 
 
+def _ensure_document_evidence_table() -> None:
+    if engine is None or DocumentEvidence is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS document_evidences (
+                id SERIAL PRIMARY KEY,
+                document_requirement_id INTEGER NOT NULL REFERENCES document_requirements(id) ON DELETE CASCADE,
+                title VARCHAR(240),
+                file_path TEXT NOT NULL,
+                is_primary BOOLEAN NOT NULL DEFAULT FALSE,
+                source_document_requirement_id INTEGER REFERENCES document_requirements(id),
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_document_evidences_requirement_id ON document_evidences(document_requirement_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_document_evidences_file_path ON document_evidences(file_path)"))
+        conn.execute(text("""
+            INSERT INTO document_evidences (document_requirement_id, title, file_path, is_primary, notes)
+            SELECT dr.id, dr.title, dr.file_path, TRUE, 'Backfilled from legacy single-file link'
+            FROM document_requirements dr
+            WHERE dr.file_path IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM document_evidences de
+                  WHERE de.document_requirement_id = dr.id
+              )
+        """))
+        conn.execute(text("""
+            WITH ranked AS (
+                SELECT id, document_requirement_id,
+                       ROW_NUMBER() OVER (PARTITION BY document_requirement_id ORDER BY is_primary DESC, created_at ASC, id ASC) AS rn
+                FROM document_evidences
+            )
+            UPDATE document_evidences de
+            SET is_primary = (ranked.rn = 1)
+            FROM ranked
+            WHERE de.id = ranked.id
+        """))
+        conn.execute(text("""
+            UPDATE document_requirements dr
+            SET file_path = de.file_path,
+                status = 'Received',
+                notes = COALESCE(de.title, dr.title)
+            FROM document_evidences de
+            WHERE de.document_requirement_id = dr.id
+              AND de.is_primary = TRUE
+        """))
+
+
 _ensure_profile_table()
+_ensure_document_evidence_table()
+
+
+def _ensure_family_members_table() -> None:
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS family_members (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(160) NOT NULL,
+                relationship VARCHAR(60) NOT NULL,
+                date_of_birth DATE,
+                citizenship VARCHAR(80),
+                residential_status VARCHAR(60),
+                oci_card_last4 VARCHAR(6),
+                pan_last4 VARCHAR(4),
+                living_in_india BOOLEAN DEFAULT TRUE,
+                currently_studying BOOLEAN DEFAULT FALSE,
+                institution_name VARCHAR(200),
+                course_details VARCHAR(200),
+                currently_working BOOLEAN DEFAULT FALSE,
+                employer_country VARCHAR(80),
+                has_india_income BOOLEAN DEFAULT FALSE,
+                india_income_notes TEXT,
+                govt_scheme_eligibility TEXT,
+                tax_relevance_notes TEXT,
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS currently_studying BOOLEAN DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS institution_name VARCHAR(200)"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS course_details VARCHAR(200)"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS currently_working BOOLEAN DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS employer_country VARCHAR(80)"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS has_india_income BOOLEAN DEFAULT FALSE"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS india_income_notes TEXT"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS govt_scheme_eligibility TEXT"))
+        conn.execute(text("ALTER TABLE family_members ADD COLUMN IF NOT EXISTS tax_relevance_notes TEXT"))
+
+
+_ensure_family_members_table()
+
+
+def _ensure_travel_history_table() -> None:
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS case_travel_history (
+                id SERIAL PRIMARY KEY,
+                case_id INTEGER NOT NULL REFERENCES tax_cases(id) ON DELETE CASCADE,
+                departure_date DATE NOT NULL,
+                arrival_date DATE NOT NULL,
+                from_country VARCHAR(80) DEFAULT 'India',
+                to_country VARCHAR(80) DEFAULT 'Outside India',
+                trip_purpose VARCHAR(120),
+                notes TEXT,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("ALTER TABLE case_travel_history ADD COLUMN IF NOT EXISTS from_country VARCHAR(80) DEFAULT 'India'"))
+        conn.execute(text("ALTER TABLE case_travel_history ADD COLUMN IF NOT EXISTS to_country VARCHAR(80) DEFAULT 'Outside India'"))
+        conn.execute(text("ALTER TABLE case_travel_history ADD COLUMN IF NOT EXISTS trip_purpose VARCHAR(120)"))
+        conn.execute(text("ALTER TABLE case_travel_history ADD COLUMN IF NOT EXISTS notes TEXT"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_case_travel_history_case_id ON case_travel_history(case_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_case_travel_history_departure_date ON case_travel_history(departure_date)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_case_travel_history_arrival_date ON case_travel_history(arrival_date)"))
+
+
+_ensure_travel_history_table()
+
+
+def _ensure_residency_settings_table() -> None:
+    if engine is None:
+        return
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS case_residency_settings (
+                id SERIAL PRIMARY KEY,
+                case_id INTEGER UNIQUE NOT NULL REFERENCES tax_cases(id) ON DELETE CASCADE,
+                fy_start_location VARCHAR(20) NOT NULL DEFAULT 'outside_india',
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("ALTER TABLE case_residency_settings ADD COLUMN IF NOT EXISTS fy_start_location VARCHAR(20) NOT NULL DEFAULT 'outside_india'"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_case_residency_settings_case_id ON case_residency_settings(case_id)"))
+
+
+_ensure_residency_settings_table()
 
 app = FastAPI(title='ITR Family API', version='0.2')
 
@@ -458,6 +955,203 @@ def _compute_residency_status(req: ResidencyAssessmentRequest) -> Dict[str, Any]
         "disclaimer": "Rule-based recommendation only. Final determination should be reviewed with a qualified tax professional for edge cases.",
     }
 
+
+def _fy_start_year(financial_year: str) -> int:
+    """
+    Convert FY labels like '2025-26' to start year (2025).
+    Falls back to current FY start year if parsing fails.
+    """
+    try:
+        raw = (financial_year or "").strip()
+        if "-" in raw:
+            return int(raw.split("-")[0])
+        return int(raw[:4])
+    except Exception:
+        today = date.today()
+        return today.year if today.month >= 4 else today.year - 1
+
+
+def _fy_bounds(start_year: int) -> tuple[date, date]:
+    return date(start_year, 4, 1), date(start_year + 1, 3, 31)
+
+
+def _travel_days_outside_india(trips: List[Dict[str, Any]], period_start: date, period_end: date) -> int:
+    """
+    Count days outside India in a period.
+    Assumption: departure date is first day outside India; arrival date is day back in India.
+    So outside interval = [departure_date, arrival_date - 1 day].
+    """
+    outside_days = 0
+    for trip in trips:
+        dep = trip.get("departure_date")
+        arr = trip.get("arrival_date")
+        if not dep or not arr:
+            continue
+        if isinstance(dep, str):
+            dep = datetime.strptime(dep, "%Y-%m-%d").date()
+        if isinstance(arr, str):
+            arr = datetime.strptime(arr, "%Y-%m-%d").date()
+        if arr <= dep:
+            continue
+        trip_start = dep
+        trip_end = arr - timedelta(days=1)
+        overlap_start = max(period_start, trip_start)
+        overlap_end = min(period_end, trip_end)
+        if overlap_end >= overlap_start:
+            outside_days += (overlap_end - overlap_start).days + 1
+    return outside_days
+
+
+def _load_case_travel_history(session, case_id: int) -> List[Dict[str, Any]]:
+    rows = session.execute(
+        text("""
+            SELECT id, case_id, departure_date, arrival_date, from_country, to_country, trip_purpose, notes, created_at, updated_at
+            FROM case_travel_history
+            WHERE case_id = :case_id
+            ORDER BY departure_date ASC, arrival_date ASC, id ASC
+        """),
+        {"case_id": case_id},
+    ).mappings().all()
+    result: List[Dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        for key in ("departure_date", "arrival_date", "created_at", "updated_at"):
+            if item.get(key):
+                item[key] = str(item[key])
+        result.append(item)
+    return result
+
+
+def _is_india_country(value: Optional[str]) -> bool:
+    text_value = (value or "").strip().lower()
+    if not text_value:
+        return False
+    if text_value in {"india", "ind", "in", "bharat", "republic of india"}:
+        return True
+    # Avoid false positives like "Outside India", "Non-India", etc.
+    negative_phrases = ("outside india", "non india", "non-india", "not india")
+    if any(phrase in text_value for phrase in negative_phrases):
+        return False
+    return False
+
+
+def _normalize_fy_start_location(raw: Optional[str], case_status: str = "NRI") -> str:
+    text_value = (raw or "").strip().lower()
+    if text_value in {"india", "outside_india"}:
+        return text_value
+    return "outside_india" if case_status in {"NRI", "RNOR"} else "india"
+
+
+def _load_residency_settings(session, case_id: int, case_status: str = "NRI") -> Dict[str, Any]:
+    row = session.execute(
+        text("SELECT fy_start_location FROM case_residency_settings WHERE case_id = :case_id"),
+        {"case_id": case_id},
+    ).mappings().first()
+    fy_start_location = _normalize_fy_start_location(row["fy_start_location"] if row else None, case_status)
+    return {"fy_start_location": fy_start_location}
+
+
+def _upsert_residency_settings(session, case_id: int, fy_start_location: Optional[str], case_status: str = "NRI") -> Dict[str, Any]:
+    normalized = _normalize_fy_start_location(fy_start_location, case_status)
+    session.execute(
+        text("""
+            INSERT INTO case_residency_settings (case_id, fy_start_location, updated_at)
+            VALUES (:case_id, :fy_start_location, NOW())
+            ON CONFLICT (case_id)
+            DO UPDATE SET fy_start_location = EXCLUDED.fy_start_location, updated_at = NOW()
+        """),
+        {"case_id": case_id, "fy_start_location": normalized},
+    )
+    return {"fy_start_location": normalized}
+
+
+def _add_segment_days_to_fy(segment_start: date, segment_end: date, location: str, fy_day_counts: Dict[int, Dict[str, int]]) -> None:
+    if segment_end < segment_start:
+        return
+    cursor = segment_start
+    while cursor <= segment_end:
+        fy_start_year = cursor.year if cursor.month >= 4 else cursor.year - 1
+        fy_start, fy_end = _fy_bounds(fy_start_year)
+        chunk_end = min(segment_end, fy_end)
+        days = (chunk_end - cursor).days + 1
+        bucket = fy_day_counts.setdefault(fy_start_year, {"india": 0, "outside_india": 0})
+        bucket[location] += days
+        cursor = chunk_end + timedelta(days=1)
+
+
+def _compute_residency_day_counts_from_travel(financial_year: str, trips: List[Dict[str, Any]], fy_start_location: str = "outside_india", case_status: str = "NRI") -> Dict[str, Any]:
+    current_start_year = _fy_start_year(financial_year)
+    window_start_year = current_start_year - 10
+    window_start, _ = _fy_bounds(window_start_year)
+    _, window_end = _fy_bounds(current_start_year)
+    location = _normalize_fy_start_location(fy_start_location, case_status)
+
+    events: List[Dict[str, Any]] = []
+    for trip in trips:
+        dep = trip.get("departure_date")
+        arr = trip.get("arrival_date")
+        from_country = trip.get("from_country")
+        to_country = trip.get("to_country")
+        if dep:
+            dep_date = dep if isinstance(dep, date) else datetime.strptime(str(dep), "%Y-%m-%d").date()
+            if window_start <= dep_date <= window_end and _is_india_country(from_country):
+                events.append({"date": dep_date, "location": "outside_india", "priority": 1})
+        if arr:
+            arr_date = arr if isinstance(arr, date) else datetime.strptime(str(arr), "%Y-%m-%d").date()
+            if window_start <= arr_date <= window_end and _is_india_country(to_country):
+                events.append({"date": arr_date, "location": "india", "priority": 2})
+
+    events.sort(key=lambda x: (x["date"], x["priority"]))
+    fy_day_counts: Dict[int, Dict[str, int]] = {}
+    cursor = window_start
+    current_location = location
+
+    for ev in events:
+        ev_date: date = ev["date"]
+        if ev_date > window_end:
+            break
+        if ev_date > cursor:
+            _add_segment_days_to_fy(cursor, ev_date - timedelta(days=1), current_location, fy_day_counts)
+        current_location = ev["location"]
+        cursor = ev_date
+
+    if cursor <= window_end:
+        _add_segment_days_to_fy(cursor, window_end, current_location, fy_day_counts)
+
+    yearly_breakdown = []
+    prior4_days = 0
+    prior7_days = 0
+    for offset in range(1, 11):
+        y = current_start_year - offset
+        y_start, y_end = _fy_bounds(y)
+        bucket = fy_day_counts.get(y, {"india": 0, "outside_india": (y_end - y_start).days + 1})
+        in_india = bucket["india"]
+        outside = bucket["outside_india"]
+        yearly_breakdown.append({
+            "financial_year": f"{y_start.year}-{str(y_end.year)[-2:]}",
+            "days_in_india": in_india,
+            "days_outside_india": outside,
+        })
+        if offset <= 4:
+            prior4_days += in_india
+        if offset <= 7:
+            prior7_days += in_india
+
+    current_bucket = fy_day_counts.get(current_start_year, {"india": 0})
+    current_in_india = current_bucket["india"]
+
+    return {
+        "days_in_india_current_fy": current_in_india,
+        "days_in_india_prior_4y": prior4_days,
+        "days_in_india_prior_7y": prior7_days,
+        "yearly_breakdown": yearly_breakdown,
+        "calculation_basis": {
+            "assumption": "Departure from India counts as outside from departure date; arrival into India counts as in India from arrival date.",
+            "current_financial_year": financial_year,
+            "fy_start_location_assumed": _normalize_fy_start_location(fy_start_location, case_status),
+        },
+    }
+
 @app.get('/health')
 def health():
     return {'status': 'ok'}
@@ -498,11 +1192,12 @@ def postal_lookup(country: str, postal_code: str):
     code = (postal_code or '').strip()
     if not code:
         raise HTTPException(status_code=400, detail='postal_code is required')
+    headers = {'User-Agent': 'ITR-Assistant/1.0'}
     try:
         if country_norm == 'india':
             if not code.isdigit() or len(code) != 6:
                 return {'ok': True, 'valid': False, 'country': 'India', 'message': 'Indian PIN must be 6 digits'}
-            r = requests.get(f'https://api.postalpincode.in/pincode/{code}', timeout=8)
+            r = requests.get(f'https://api.postalpincode.in/pincode/{code}', timeout=8, headers=headers)
             payload = r.json() if r.ok else []
             first = payload[0] if isinstance(payload, list) and payload else {}
             offices = first.get('PostOffice') or []
@@ -522,7 +1217,7 @@ def postal_lookup(country: str, postal_code: str):
             if not (code.isdigit() and len(code) in {5, 9}):
                 return {'ok': True, 'valid': False, 'country': 'US', 'message': 'US ZIP must be 5 or 9 digits'}
             query_code = code[:5]
-            r = requests.get(f'https://api.zippopotam.us/us/{query_code}', timeout=8)
+            r = requests.get(f'https://api.zippopotam.us/us/{query_code}', timeout=8, headers=headers)
             if not r.ok:
                 return {'ok': True, 'valid': False, 'country': 'US', 'message': 'ZIP not found'}
             payload = r.json()
@@ -538,8 +1233,19 @@ def postal_lookup(country: str, postal_code: str):
                 'suggested_country': 'US',
             }
         return {'ok': True, 'valid': False, 'message': 'Postal lookup currently supports India and US only'}
-    except Exception as e:
-        return {'ok': False, 'valid': False, 'message': f'Lookup failed: {e}'}
+    except requests.RequestException:
+        return {
+            'ok': True,
+            'valid': False,
+            'country': 'India' if country_norm == 'india' else 'US' if country_norm in {'us', 'usa', 'united states', 'united states of america'} else None,
+            'message': 'Postal lookup service is temporarily unavailable. You can continue and save address details manually.',
+        }
+    except Exception:
+        return {
+            'ok': True,
+            'valid': False,
+            'message': 'Unable to validate postal code right now. Please save manually and retry later.',
+        }
 
 
 @app.get('/api/reference/tax-credits')
@@ -702,20 +1408,35 @@ def required_documents(case_id: int):
             ).all()
             for d in other_docs:
                 linked_candidates[d.code] = {'source_case_id': d.case_id, 'file_path': d.file_path}
+        evidence_map = _load_evidences_for_requirements(session, [r.id for r in rows])
         out = [
             {
                 'id': r.id,
                 'code': r.code,
                 'title': r.title,
+                'display_title': _checklist_display_title(r),
                 'category': r.category,
                 'institution': r.institution,
                 'required': r.required,
                 'status': r.status,
                 'file_path': r.file_path,
+                'is_not_applicable': r.status == 'Not applicable',
+                'not_applicable_reason': _parse_not_applicable_reason(r.notes),
                 'portal': {
                     'name': DOCUMENT_PORTAL_MAP.get(r.code, (r.institution or 'Source Portal', None))[0],
                     'url': DOCUMENT_PORTAL_MAP.get(r.code, (None, None))[1],
                 },
+                'evidences': [
+                    {
+                        'id': e.id,
+                        'title': e.title,
+                        'file_path': e.file_path,
+                        'is_primary': e.is_primary,
+                        'source_document_requirement_id': e.source_document_requirement_id,
+                    }
+                    for e in evidence_map.get(r.id, [])
+                ],
+                'has_multiple_sources': len(evidence_map.get(r.id, [])) > 1,
                 'reusable_across_years': _is_doc_reusable_across_years(r.code),
                 'link_candidate': linked_candidates.get(r.code),
             }
@@ -746,14 +1467,12 @@ def upload_document(case_id: int, file: UploadFile = File(...), code: Optional[s
             stmt = select(DocumentRequirement).where(DocumentRequirement.case_id == case_id, DocumentRequirement.code == code)
             dr = session.execute(stmt).scalars().first()
             if dr:
-                dr.file_path = dest
-                dr.status = 'Received'
-                session.add(dr)
+                _add_document_evidence(session, dr, dest, title=filename, make_primary=True)
                 session.add(AuditLog(
                     case_id=case_id,
                     action='DOCUMENT_UPLOAD',
                     entity='DocumentRequirement',
-                    details=f'{dr.code}:{filename}'
+                    details=f'{dr.code}:{filename} (set as primary source)'
                 ))
                 session.commit()
             elif DocumentRequirement is not None:
@@ -767,11 +1486,13 @@ def upload_document(case_id: int, file: UploadFile = File(...), code: Optional[s
                     file_path=dest,
                 )
                 session.add(dr)
+                session.flush()
+                _add_document_evidence(session, dr, dest, title=filename, make_primary=True)
                 session.add(AuditLog(
                     case_id=case_id,
                     action='DOCUMENT_UPLOAD',
                     entity='DocumentRequirement',
-                    details=f'{code}:{filename}'
+                    details=f'{code}:{filename} (new category with primary source)'
                 ))
                 session.commit()
         return {'ok': True, 'path': dest}
@@ -785,6 +1506,55 @@ def upload_document_alias(
     code: Optional[str] = Form(None),
 ):
     return upload_document(case_id=case_id, file=file, code=code or document_type)
+
+
+@app.get('/api/cases/{case_id}/documents/{doc_code}/preview')
+def preview_case_document(case_id: int, doc_code: str, download: bool = False):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not doc or not doc.file_path:
+            raise HTTPException(status_code=404, detail='Document file not found')
+        path = doc.file_path
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail='Linked file path is missing on disk')
+        media_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+        filename = os.path.basename(path)
+        disposition = 'attachment' if download else 'inline'
+        return FileResponse(
+            path=path,
+            media_type=media_type,
+            filename=filename,
+            headers={'Content-Disposition': f'{disposition}; filename="{filename}"'},
+        )
+
+
+@app.get('/api/documents/{document_id}/preview')
+def preview_vault_document(document_id: int, download: bool = False):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        doc = session.get(DocumentRequirement, document_id)
+        if not doc or not doc.file_path:
+            raise HTTPException(status_code=404, detail='Document file not found')
+        path = doc.file_path
+        if not os.path.exists(path):
+            raise HTTPException(status_code=404, detail='Linked file path is missing on disk')
+        media_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+        filename = os.path.basename(path)
+        disposition = 'attachment' if download else 'inline'
+        return FileResponse(
+            path=path,
+            media_type=media_type,
+            filename=filename,
+            headers={'Content-Disposition': f'{disposition}; filename="{filename}"'},
+        )
 
 
 @app.post('/api/cases/{case_id}/documents/{doc_code}/reuse')
@@ -824,18 +1594,371 @@ def reuse_document_from_other_year(case_id: int, doc_code: str):
         if not source_doc:
             raise HTTPException(status_code=404, detail='No uploaded document found in prior years for this document code')
 
-        target_doc.file_path = source_doc.file_path
-        target_doc.status = 'Received'
-        target_doc.notes = f"Linked from AY {source_case.assessment_year} case {source_case.id}"
-        session.add(target_doc)
+        evidence = _add_document_evidence(
+            session,
+            target_doc,
+            source_doc.file_path,
+            title=source_doc.title or f"{doc_code} from case {source_case.id}",
+            source_document_requirement_id=source_doc.id,
+            make_primary=(target_doc.file_path is None),
+        )
         session.add(AuditLog(
             case_id=case_id,
             action='DOCUMENT_REUSED',
             entity='DocumentRequirement',
-            details=f'{doc_code} linked from case {source_case.id}',
+            details=f'{doc_code} linked from case {source_case.id} as {"primary" if evidence.is_primary else "supporting"} source',
         ))
         session.commit()
-        return {'ok': True, 'linked_from_case_id': source_case.id, 'path': target_doc.file_path}
+        return {'ok': True, 'linked_from_case_id': source_case.id, 'path': evidence.file_path, 'evidence_id': evidence.id, 'is_primary': evidence.is_primary}
+
+
+@app.post('/api/cases/{case_id}/documents/{doc_code}/link')
+def link_document_from_vault(case_id: int, doc_code: str, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    source_document_id = data.get('source_document_id')
+    if not source_document_id:
+        raise HTTPException(status_code=400, detail='source_document_id is required')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        source_doc = session.get(DocumentRequirement, int(source_document_id))
+        if not source_doc or not source_doc.file_path:
+            raise HTTPException(status_code=404, detail='Source document not found or has no linked file')
+        source_case = session.get(TaxCase, source_doc.case_id)
+        if not source_case or source_case.taxpayer_id != case.taxpayer_id:
+            raise HTTPException(status_code=400, detail='Source document must belong to the same taxpayer')
+        if not _is_doc_reusable_across_years(doc_code):
+            raise HTTPException(status_code=400, detail='This document code is not reusable across years')
+
+        target_doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not target_doc:
+            target_doc = DocumentRequirement(
+                case_id=case_id,
+                code=doc_code,
+                category=source_doc.category or 'Uploaded',
+                title=source_doc.title or doc_code,
+                required=False,
+                status='Missing',
+            )
+            session.add(target_doc)
+            session.flush()
+
+        evidence = _add_document_evidence(
+            session,
+            target_doc,
+            source_doc.file_path,
+            title=source_doc.title or f"{doc_code} from case {source_doc.case_id}",
+            source_document_requirement_id=source_doc.id,
+            make_primary=(target_doc.file_path is None),
+        )
+        session.add(AuditLog(
+            case_id=case_id,
+            action='DOCUMENT_LINKED',
+            entity='DocumentRequirement',
+            details=f'{doc_code} linked from document {source_doc.id} (case {source_doc.case_id}) as {"primary" if evidence.is_primary else "supporting"} source',
+        ))
+        session.commit()
+        return {'ok': True, 'document_id': target_doc.id, 'path': evidence.file_path, 'evidence_id': evidence.id, 'is_primary': evidence.is_primary}
+
+
+@app.put('/api/cases/{case_id}/documents/{doc_code}/rename')
+def rename_document(case_id: int, doc_code: str, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    new_title = (data.get('title') or '').strip()
+    if not new_title:
+        raise HTTPException(status_code=400, detail='title is required')
+    evidence_id = data.get('evidence_id')
+    with SessionLocal() as session:
+        doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not doc:
+            raise HTTPException(status_code=404, detail='Document requirement not found')
+        target_evidence = None
+        evidences = session.scalars(
+            select(DocumentEvidence).where(DocumentEvidence.document_requirement_id == doc.id).order_by(
+                DocumentEvidence.is_primary.desc(), DocumentEvidence.id.asc()
+            )
+        ).all() if DocumentEvidence is not None else []
+        if evidence_id:
+            target_evidence = next((e for e in evidences if e.id == int(evidence_id)), None)
+            if not target_evidence:
+                raise HTTPException(status_code=404, detail='Document evidence not found')
+        elif evidences:
+            target_evidence = evidences[0]
+
+        old_title = target_evidence.title if target_evidence else doc.title
+        if target_evidence:
+            target_evidence.title = new_title
+            session.add(target_evidence)
+        elif not evidences:
+            doc.title = new_title
+            session.add(doc)
+        session.add(AuditLog(
+            case_id=case_id,
+            action='DOCUMENT_RENAMED',
+            entity='DocumentRequirement',
+            details=(
+                f'{doc_code} file label renamed: "{old_title}" -> "{new_title}" (evidence {target_evidence.id})'
+                if target_evidence
+                else f'{doc_code}: "{old_title}" -> "{new_title}"'
+            ),
+        ))
+        session.commit()
+        return {'ok': True, 'title': doc.title}
+
+
+@app.post('/api/cases/{case_id}/documents/{doc_code}/applicability')
+def set_document_applicability(case_id: int, doc_code: str, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    applicable = bool(data.get('applicable', True))
+    reason = (data.get('reason') or '').strip()
+    with SessionLocal() as session:
+        doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not doc:
+            raise HTTPException(status_code=404, detail='Document requirement not found')
+        evidences = session.scalars(
+            select(DocumentEvidence).where(DocumentEvidence.document_requirement_id == doc.id)
+        ).all() if DocumentEvidence is not None else []
+
+        if not applicable:
+            doc.status = 'Not applicable'
+            doc.notes = f"Not applicable: {reason}" if reason else "Not applicable: User marked this item as not applicable for current filing."
+        else:
+            if evidences:
+                _sync_requirement_from_evidences(doc, evidences)
+            else:
+                doc.file_path = None
+                doc.status = 'Missing' if doc.required else 'Not applicable'
+            if _parse_not_applicable_reason(doc.notes):
+                doc.notes = None
+        session.add(doc)
+        session.add(AuditLog(
+            case_id=case_id,
+            action='DOCUMENT_APPLICABILITY_UPDATED',
+            entity='DocumentRequirement',
+            details=f'{doc_code} marked as {"applicable" if applicable else "not applicable"}' + (f' ({reason})' if reason else ''),
+        ))
+        session.commit()
+        return {
+            'ok': True,
+            'status': doc.status,
+            'is_not_applicable': doc.status == 'Not applicable',
+            'not_applicable_reason': _parse_not_applicable_reason(doc.notes),
+        }
+
+
+@app.post('/api/cases/{case_id}/documents/{doc_code}/unlink')
+def unlink_document(case_id: int, doc_code: str, data: Optional[Dict[str, Any]] = None):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    payload = data or {}
+    delete_file = bool(payload.get('delete_file'))
+    evidence_id = payload.get('evidence_id')
+    with SessionLocal() as session:
+        doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not doc:
+            raise HTTPException(status_code=404, detail='Document requirement not found')
+        evidences = session.scalars(
+            select(DocumentEvidence).where(DocumentEvidence.document_requirement_id == doc.id).order_by(
+                DocumentEvidence.is_primary.desc(), DocumentEvidence.id.asc()
+            )
+        ).all() if DocumentEvidence is not None else []
+        if not evidences:
+            doc.file_path = None
+            doc.status = 'Missing' if doc.required else 'Not applicable'
+            doc.notes = None
+            session.add(doc)
+            session.commit()
+            return {'ok': True, 'file_deleted': False}
+
+        target = evidences[0]
+        if evidence_id:
+            target = next((e for e in evidences if e.id == int(evidence_id)), None)
+            if not target:
+                raise HTTPException(status_code=404, detail='Document evidence not found')
+        old_path = target.file_path
+        was_primary = target.is_primary
+        session.delete(target)
+        remaining = [e for e in evidences if e.id != target.id]
+        if was_primary and remaining:
+            remaining[0].is_primary = True
+            session.add(remaining[0])
+        _sync_requirement_from_evidences(doc, remaining)
+        session.add(doc)
+        session.add(AuditLog(
+            case_id=case_id,
+            action='DOCUMENT_UNLINKED',
+            entity='DocumentRequirement',
+            details=f'{doc_code} evidence unlinked (id {target.id})',
+        ))
+        session.commit()
+
+        file_deleted = False
+        if delete_file and old_path:
+            with SessionLocal() as verify_session:
+                ref_count = verify_session.scalar(
+                    select(text('COUNT(1)')).select_from(DocumentRequirement).where(
+                        DocumentRequirement.file_path == old_path
+                    )
+                ) or 0
+                evidence_ref_count = verify_session.scalar(
+                    select(text('COUNT(1)')).select_from(DocumentEvidence).where(
+                        DocumentEvidence.file_path == old_path
+                    )
+                ) or 0
+            if ref_count == 0 and evidence_ref_count == 0 and os.path.exists(old_path):
+                try:
+                    os.remove(old_path)
+                    file_deleted = True
+                except OSError:
+                    file_deleted = False
+
+        return {'ok': True, 'file_deleted': file_deleted}
+
+
+@app.delete('/api/cases/{case_id}/documents/{doc_code}')
+def delete_document(case_id: int, doc_code: str, delete_file: bool = False):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not doc:
+            raise HTTPException(status_code=404, detail='Document requirement not found')
+
+        evidence_rows = session.scalars(
+            select(DocumentEvidence).where(DocumentEvidence.document_requirement_id == doc.id)
+        ).all() if DocumentEvidence is not None else []
+        old_paths = [e.file_path for e in evidence_rows if e.file_path]
+        for e in evidence_rows:
+            session.delete(e)
+        if doc.required:
+            doc.file_path = None
+            doc.status = 'Missing'
+            doc.notes = None
+            session.add(doc)
+            action = 'DOCUMENT_CLEARED'
+            details = f'{doc_code} is required, so record kept and file link cleared'
+        else:
+            session.delete(doc)
+            action = 'DOCUMENT_DELETED'
+            details = f'{doc_code} optional record deleted'
+
+        session.add(AuditLog(
+            case_id=case_id,
+            action=action,
+            entity='DocumentRequirement',
+            details=details,
+        ))
+        session.commit()
+
+        file_deleted = False
+        if delete_file and old_paths:
+            with SessionLocal() as verify_session:
+                for old_path in old_paths:
+                    ref_count = verify_session.scalar(
+                        select(text('COUNT(1)')).select_from(DocumentRequirement).where(
+                            DocumentRequirement.file_path == old_path
+                        )
+                    ) or 0
+                    evidence_ref_count = verify_session.scalar(
+                        select(text('COUNT(1)')).select_from(DocumentEvidence).where(
+                            DocumentEvidence.file_path == old_path
+                        )
+                    ) or 0
+                    if ref_count == 0 and evidence_ref_count == 0 and os.path.exists(old_path):
+                        try:
+                            os.remove(old_path)
+                            file_deleted = True
+                        except OSError:
+                            pass
+
+        return {'ok': True, 'file_deleted': file_deleted}
+
+
+@app.post('/api/cases/{case_id}/documents/{doc_code}/evidence/{evidence_id}/primary')
+def set_document_primary_evidence(case_id: int, doc_code: str, evidence_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        doc = session.scalar(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == doc_code,
+            )
+        )
+        if not doc:
+            raise HTTPException(status_code=404, detail='Document requirement not found')
+        evidences = session.scalars(
+            select(DocumentEvidence).where(DocumentEvidence.document_requirement_id == doc.id).order_by(DocumentEvidence.id.asc())
+        ).all() if DocumentEvidence is not None else []
+        if not evidences:
+            raise HTTPException(status_code=404, detail='No evidence linked for this document')
+        target = next((e for e in evidences if e.id == evidence_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail='Document evidence not found')
+        for e in evidences:
+            e.is_primary = (e.id == target.id)
+            session.add(e)
+        _sync_requirement_from_evidences(doc, evidences)
+        session.add(doc)
+        session.add(AuditLog(
+            case_id=case_id,
+            action='DOCUMENT_PRIMARY_SET',
+            entity='DocumentRequirement',
+            details=f'{doc_code} primary evidence set to id {target.id}',
+        ))
+        session.commit()
+        return {'ok': True, 'evidence_id': target.id, 'file_path': target.file_path}
+
+
+@app.get('/api/document-evidences/{evidence_id}/preview')
+def preview_evidence_document(evidence_id: int, download: bool = False):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        evidence = session.get(DocumentEvidence, evidence_id)
+        if not evidence:
+            raise HTTPException(status_code=404, detail='Document evidence not found')
+        path = evidence.file_path
+        if not path or not os.path.exists(path):
+            raise HTTPException(status_code=404, detail='Linked file path is missing on disk')
+        media_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+        filename = os.path.basename(path)
+        disposition = 'attachment' if download else 'inline'
+        return FileResponse(
+            path=path,
+            media_type=media_type,
+            filename=filename,
+            headers={'Content-Disposition': f'{disposition}; filename="{filename}"'},
+        )
 
 
 @app.get('/api/taxpayers/{taxpayer_id}/documents/vault')
@@ -853,6 +1976,7 @@ def taxpayer_document_vault(taxpayer_id: int):
                 DocumentRequirement.file_path.is_not(None),
             )
         ).all()
+        evidence_map = _load_evidences_for_requirements(session, [d.id for d in docs])
         return {
             'ok': True,
             'documents': [
@@ -866,6 +1990,8 @@ def taxpayer_document_vault(taxpayer_id: int):
                     'assessment_year': case_by_id[d.case_id].assessment_year if d.case_id in case_by_id else None,
                     'financial_year': case_by_id[d.case_id].financial_year if d.case_id in case_by_id else None,
                     'reusable_across_years': _is_doc_reusable_across_years(d.code),
+                    'evidence_count': len(evidence_map.get(d.id, [])),
+                    'has_multiple_sources': len(evidence_map.get(d.id, [])) > 1,
                 }
                 for d in docs
             ],
@@ -934,6 +2060,11 @@ def get_residency(case_id: int):
         if not case:
             raise HTTPException(status_code=404, detail='Case not found')
         record = session.scalar(select(ResidencyRecord).where(ResidencyRecord.case_id == case_id))
+        residency_settings = _load_residency_settings(session, case_id, case.residential_status)
+        travel_history = _load_case_travel_history(session, case_id)
+        travel_counts = _compute_residency_day_counts_from_travel(
+            case.financial_year, travel_history, residency_settings.get("fy_start_location"), case.residential_status
+        )
         return {
             'ok': True,
             'residency': None if not record else {
@@ -949,7 +2080,208 @@ def get_residency(case_id: int):
                 'reviewed_by': record.reviewed_by,
                 'notes': record.notes,
             },
+            'travel_history': travel_history,
+            'residency_settings': residency_settings,
+            'computed_days_from_travel': {
+                'days_in_india_current_fy': travel_counts['days_in_india_current_fy'],
+                'days_in_india_prior_4y': travel_counts['days_in_india_prior_4y'],
+                'days_in_india_prior_7y': travel_counts['days_in_india_prior_7y'],
+                'yearly_breakdown': travel_counts['yearly_breakdown'],
+                'calculation_basis': travel_counts['calculation_basis'],
+            },
             'case_status': case.residential_status,
+        }
+
+
+@app.get('/api/cases/{case_id}/travel-history')
+def get_travel_history(case_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        settings = _load_residency_settings(session, case_id, case.residential_status)
+        history = _load_case_travel_history(session, case_id)
+        counts = _compute_residency_day_counts_from_travel(
+            case.financial_year, history, settings.get("fy_start_location"), case.residential_status
+        )
+        return {'ok': True, 'travel_history': history, 'computed_days': counts, 'residency_settings': settings}
+
+
+@app.post('/api/cases/{case_id}/travel-history')
+def add_travel_history(case_id: int, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    departure = str(data.get('departure_date') or '').strip()
+    arrival = str(data.get('arrival_date') or '').strip()
+    if not departure or not arrival:
+        raise HTTPException(status_code=400, detail='departure_date and arrival_date are required')
+    try:
+        dep_date = datetime.strptime(departure, '%Y-%m-%d').date()
+        arr_date = datetime.strptime(arrival, '%Y-%m-%d').date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail='Dates must be YYYY-MM-DD')
+    if arr_date <= dep_date:
+        raise HTTPException(status_code=400, detail='arrival_date must be after departure_date')
+
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        row = session.execute(
+            text("""
+                INSERT INTO case_travel_history
+                    (case_id, departure_date, arrival_date, from_country, to_country, trip_purpose, notes, updated_at)
+                VALUES
+                    (:case_id, :departure_date, :arrival_date, :from_country, :to_country, :trip_purpose, :notes, NOW())
+                RETURNING id
+            """),
+            {
+                'case_id': case_id,
+                'departure_date': dep_date,
+                'arrival_date': arr_date,
+                'from_country': data.get('from_country') or 'India',
+                'to_country': data.get('to_country') or 'Outside India',
+                'trip_purpose': data.get('trip_purpose'),
+                'notes': data.get('notes'),
+            },
+        ).first()
+        session.commit()
+        return {'ok': True, 'id': row[0]}
+
+
+@app.put('/api/cases/{case_id}/travel-history/{travel_id}')
+def update_travel_history(case_id: int, travel_id: int, data: Dict[str, Any]):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        current = session.execute(
+            text("SELECT id, departure_date, arrival_date FROM case_travel_history WHERE case_id = :case_id AND id = :id"),
+            {'case_id': case_id, 'id': travel_id},
+        ).mappings().first()
+        if not current:
+            raise HTTPException(status_code=404, detail='Travel history entry not found')
+
+        dep_raw = data.get('departure_date', current['departure_date'])
+        arr_raw = data.get('arrival_date', current['arrival_date'])
+        dep_date = dep_raw if isinstance(dep_raw, date) else datetime.strptime(str(dep_raw), '%Y-%m-%d').date()
+        arr_date = arr_raw if isinstance(arr_raw, date) else datetime.strptime(str(arr_raw), '%Y-%m-%d').date()
+        if arr_date <= dep_date:
+            raise HTTPException(status_code=400, detail='arrival_date must be after departure_date')
+
+        session.execute(
+            text("""
+                UPDATE case_travel_history
+                SET departure_date = :departure_date,
+                    arrival_date = :arrival_date,
+                    from_country = :from_country,
+                    to_country = :to_country,
+                    trip_purpose = :trip_purpose,
+                    notes = :notes,
+                    updated_at = NOW()
+                WHERE case_id = :case_id AND id = :id
+            """),
+            {
+                'case_id': case_id,
+                'id': travel_id,
+                'departure_date': dep_date,
+                'arrival_date': arr_date,
+                'from_country': data.get('from_country') or 'India',
+                'to_country': data.get('to_country') or 'Outside India',
+                'trip_purpose': data.get('trip_purpose'),
+                'notes': data.get('notes'),
+            },
+        )
+        session.commit()
+        return {'ok': True}
+
+
+@app.delete('/api/cases/{case_id}/travel-history/{travel_id}')
+def delete_travel_history(case_id: int, travel_id: int):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        session.execute(
+            text("DELETE FROM case_travel_history WHERE case_id = :case_id AND id = :id"),
+            {'case_id': case_id, 'id': travel_id},
+        )
+        session.commit()
+        return {'ok': True}
+
+
+@app.post('/api/cases/{case_id}/residency/recompute-from-travel')
+def recompute_residency_from_travel(case_id: int, data: Dict[str, Any] | None = None):
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    payload = data or {}
+    with SessionLocal() as session:
+        case = session.get(TaxCase, case_id)
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        taxpayer = session.get(Taxpayer, case.taxpayer_id)
+        fy_start_location = payload.get('fy_start_location')
+        if fy_start_location:
+            settings = _upsert_residency_settings(session, case_id, fy_start_location, case.residential_status)
+        else:
+            settings = _load_residency_settings(session, case_id, case.residential_status)
+
+        travel_history = _load_case_travel_history(session, case_id)
+        computed = _compute_residency_day_counts_from_travel(
+            case.financial_year, travel_history, settings.get('fy_start_location'), case.residential_status
+        )
+
+        record = session.scalar(select(ResidencyRecord).where(ResidencyRecord.case_id == case_id))
+        if not record:
+            record = ResidencyRecord(case_id=case_id)
+        record.days_in_india_current_fy = computed['days_in_india_current_fy']
+        record.days_in_india_prior_4y = computed['days_in_india_prior_4y']
+        record.days_in_india_prior_7y = computed['days_in_india_prior_7y']
+        if 'nonresident_years_prior_10y' in payload:
+            record.nonresident_years_prior_10y = payload.get('nonresident_years_prior_10y')
+        elif record.nonresident_years_prior_10y is None:
+            record.nonresident_years_prior_10y = 0
+        if 'date_returned_to_india' in payload:
+            raw_date = payload.get('date_returned_to_india')
+            record.date_returned_to_india = None if not raw_date else datetime.strptime(raw_date, '%Y-%m-%d').date()
+        session.add(record)
+        session.commit()
+
+        citizenship = (getattr(taxpayer, 'citizenship', 'Indian') or 'Indian').strip().lower()
+        req = ResidencyAssessmentRequest(
+            days_in_india_current_fy=record.days_in_india_current_fy or 0,
+            days_in_india_prior_4y=record.days_in_india_prior_4y or 0,
+            days_in_india_prior_7y=record.days_in_india_prior_7y or 0,
+            nonresident_years_prior_10y=record.nonresident_years_prior_10y or 0,
+            indian_citizen_or_pio=citizenship != 'foreign',
+            visiting_india=bool(record.date_returned_to_india),
+            indian_income_excluding_foreign=float(payload.get('indian_income_excluding_foreign') or 0),
+            not_liable_to_tax_elsewhere=bool(payload.get('not_liable_to_tax_elsewhere') or False),
+        )
+        assessment = _compute_residency_status(req)
+        return {
+            'ok': True,
+            'residency_settings': settings,
+            'computed_days': computed,
+            'assessment': assessment,
+            'residency': {
+                'days_in_india_current_fy': record.days_in_india_current_fy,
+                'days_in_india_prior_4y': record.days_in_india_prior_4y,
+                'days_in_india_prior_7y': record.days_in_india_prior_7y,
+                'nonresident_years_prior_10y': record.nonresident_years_prior_10y,
+                'date_returned_to_india': record.date_returned_to_india.isoformat() if record.date_returned_to_india else None,
+                'foreign_income_received_in_india': record.foreign_income_received_in_india,
+                'business_controlled_from_india': record.business_controlled_from_india,
+                'conclusion': record.conclusion,
+                'reviewed_by': record.reviewed_by,
+                'notes': record.notes,
+            },
         }
 
 
@@ -980,6 +2312,8 @@ def save_residency(case_id: int, data: Dict[str, Any]):
         if 'date_returned_to_india' in data:
             value = data['date_returned_to_india']
             record.date_returned_to_india = None if not value else datetime.strptime(value, '%Y-%m-%d').date()
+        if 'fy_start_location' in data:
+            _upsert_residency_settings(session, case_id, data.get('fy_start_location'), case.residential_status)
         session.add(record)
         session.commit()
         return {'ok': True}
@@ -1204,7 +2538,58 @@ def update_property(case_id: int, property_id: int, data: Dict[str, Any]):
         return {'ok': True}
 
 
-@app.get('/api/portal/export')
+@app.post('/api/cases/{case_id}/loan-cert/parse')
+def parse_loan_certificate(case_id: int):
+    """
+    Parse the uploaded LOAN_CERT document and return calculated interest/principal
+    via monthly-rest amortization. Used by the Property page to auto-populate fields.
+    """
+    if SessionLocal is None:
+        raise HTTPException(status_code=500, detail='Database not configured')
+    with SessionLocal() as session:
+        doc = session.scalars(
+            select(DocumentRequirement).where(
+                DocumentRequirement.case_id == case_id,
+                DocumentRequirement.code == 'LOAN_CERT',
+            )
+        ).first()
+        if not doc:
+            raise HTTPException(status_code=404, detail='LOAN_CERT requirement not found')
+
+        evidences = _load_evidences_for_requirements(session, [doc.id]).get(doc.id, [])
+        primary = next((e for e in evidences if e.is_primary), evidences[0] if evidences else None)
+        file_path = primary.file_path if primary else doc.file_path
+
+        if not file_path or not os.path.exists(file_path):
+            return {
+                'ok': False,
+                'error': 'No file uploaded for LOAN_CERT yet. Upload the home loan statement first.',
+            }
+
+        try:
+            from backend.app.document_parser import DocumentParserFactory, DocumentType
+            parsed = DocumentParserFactory.parse_document(file_path, DocumentType.HOME_LOAN_CERT)
+            d = parsed.extracted_data
+
+            return {
+                'ok': parsed.success,
+                'extracted': d,
+                'warnings': parsed.warnings,
+                'errors': parsed.errors,
+                'deduction_summary': {
+                    'interest_paid': d.get('interest_paid', 0),
+                    'principal_paid': d.get('principal_paid', 0),
+                    'section_24b_self_occ_limit': d.get('section_24b_deductible_self_occ', 0),
+                    'section_80c_principal_limit': d.get('section_80c_deductible', 0),
+                    'note': (
+                        'Section 24(b): Interest deduction capped at ₹2,00,000 for self-occupied. '
+                        'No cap if property is let-out. '
+                        'Section 80C: Principal repayment deductible up to ₹1,50,000 overall limit.'
+                    ),
+                },
+            }
+        except Exception as e:
+            return {'ok': False, 'error': str(e)}
 def export_case_bundle(case_id: int, format: str = 'json'):
     if SessionLocal is None:
         raise HTTPException(status_code=500, detail='Database not configured')
@@ -1917,6 +3302,172 @@ class IncomeEntry(BaseModel):
     amount: float
     tds_deducted: float = 0
     fiscal_year: str = '2025-26'
+    source_name: Optional[str] = None
+    evidence_code: Optional[str] = None
+    notes: Optional[str] = None
+    amount_in_return: Optional[float] = None
+
+
+class AutoIncomeDraftEntry(BaseModel):
+    income_type: str
+    source_name: str
+    gross_amount: float = 0
+    tds_amount: float = 0
+    doc_code: Optional[str] = None
+    evidence_id: Optional[int] = None
+    rationale: Optional[str] = None
+    confidence: Optional[str] = None
+
+
+class AutoIncomeApplyRequest(BaseModel):
+    entries: List[AutoIncomeDraftEntry]
+    replace_existing: bool = False
+
+
+@app.post('/api/cases/{case_id}/income/auto-draft')
+def generate_income_auto_draft(case_id: int):
+    if not SessionLocal:
+        return {'error': 'Database not configured'}
+    session = SessionLocal()
+    try:
+        case = session.query(TaxCase).filter(TaxCase.id == case_id).first()
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+
+        docs = session.scalars(
+            select(DocumentRequirement).where(DocumentRequirement.case_id == case_id)
+        ).all()
+        evidence_map = _load_evidences_for_requirements(session, [d.id for d in docs])
+        parsed_docs = []
+        draft_entries: List[Dict[str, Any]] = []
+        skipped = []
+
+        for doc in docs:
+            if doc.status == 'Not applicable':
+                skipped.append({'code': doc.code, 'reason': 'Marked not applicable'})
+                continue
+            evidences = evidence_map.get(doc.id, [])
+            primary = next((e for e in evidences if e.is_primary), evidences[0] if evidences else None)
+            file_path = primary.file_path if primary else doc.file_path
+            if not file_path or not os.path.exists(file_path):
+                continue
+            doc_type_name = _doc_type_for_code(doc.code)
+            if not doc_type_name:
+                continue
+            try:
+                from backend.app.document_parser import DocumentParserFactory, DocumentType
+                doc_type_enum = DocumentType[doc_type_name]
+                parsed = DocumentParserFactory.parse_document(file_path, doc_type_enum)
+                parsed_payload = {
+                    'ok': parsed.success,
+                    'document_type': parsed.doc_type,
+                    'extracted_data': parsed.extracted_data,
+                    'warnings': parsed.warnings,
+                    'errors': parsed.errors,
+                }
+                parsed_docs.append({
+                    'doc_code': doc.code,
+                    'display_title': _checklist_display_title(doc),
+                    'document_type': parsed.doc_type,
+                    'warnings': parsed.warnings,
+                    'errors': parsed.errors,
+                    'evidence_id': primary.id if primary else None,
+                })
+                draft_entries.extend(_build_income_drafts_from_parse(doc, parsed_payload, primary.id if primary else None))
+            except Exception as e:
+                parsed_docs.append({
+                    'doc_code': doc.code,
+                    'display_title': _checklist_display_title(doc),
+                    'document_type': doc_type_name.lower(),
+                    'warnings': [],
+                    'errors': [str(e)],
+                    'evidence_id': primary.id if primary else None,
+                })
+
+        # Smart deduplication: detect same income from multiple sources
+        draft_entries = _deduplicate_draft_entries(draft_entries)
+
+        selected_entries = [e for e in draft_entries if e.get('selected', True)]
+        dup_count = sum(1 for e in draft_entries if e.get('is_duplicate', False))
+
+        totals = {
+            'gross_amount': round(sum(_to_amount(e.get('gross_amount')) for e in selected_entries), 2),
+            'tds_amount': round(sum(_to_amount(e.get('tds_amount')) for e in selected_entries), 2),
+            'entries': len(selected_entries),
+            'total_draft': len(draft_entries),
+            'duplicate_count': dup_count,
+            'documents_scanned': len(parsed_docs),
+        }
+        return {
+            'ok': True,
+            'case_id': case_id,
+            'draft_entries': draft_entries,
+            'parsed_documents': parsed_docs,
+            'skipped_documents': skipped,
+            'totals': totals,
+            'disclaimer': 'Auto-draft is assistance only. Review and edit before applying.',
+        }
+    finally:
+        session.close()
+
+
+@app.post('/api/cases/{case_id}/income/auto-apply')
+def apply_income_auto_draft(case_id: int, payload: AutoIncomeApplyRequest):
+    if not SessionLocal:
+        return {'error': 'Database not configured'}
+    session = SessionLocal()
+    try:
+        case = session.query(TaxCase).filter(TaxCase.id == case_id).first()
+        if not case:
+            raise HTTPException(status_code=404, detail='Case not found')
+        from itr_workspace.models import IncomeEntry as IncomeModel
+
+        if payload.replace_existing:
+            existing = session.query(IncomeModel).filter(IncomeModel.case_id == case_id).all()
+            for row in existing:
+                session.delete(row)
+            session.flush()
+
+        created = 0
+        skipped = 0
+        for entry in payload.entries:
+            gross_amount = _to_amount(entry.gross_amount)
+            tds_amount = _to_amount(entry.tds_amount)
+            if gross_amount <= 0 and tds_amount <= 0:
+                skipped += 1
+                continue
+            duplicate = session.query(IncomeModel).filter(
+                IncomeModel.case_id == case_id,
+                IncomeModel.income_type == entry.income_type,
+                IncomeModel.source_name == entry.source_name,
+                IncomeModel.gross_amount == gross_amount,
+                IncomeModel.tds_amount == tds_amount,
+            ).first()
+            if duplicate:
+                skipped += 1
+                continue
+            item = IncomeModel(
+                case_id=case_id,
+                income_type=entry.income_type,
+                source_name=entry.source_name,
+                gross_amount=gross_amount,
+                tds_amount=tds_amount,
+                amount_in_return=max(gross_amount, 0),
+                evidence_code=entry.doc_code,
+                notes=f"Auto-drafted from documents. {entry.rationale or ''}".strip(),
+            )
+            session.add(item)
+            created += 1
+        session.add(AuditLog(
+            case_id=case_id,
+            action='INCOME_AUTO_APPLIED',
+            entity='IncomeEntry',
+            details=f'Auto-applied entries: created={created}, skipped={skipped}, replace_existing={payload.replace_existing}',
+        ))
+        session.commit()
+        return {'ok': True, 'created': created, 'skipped': skipped}
+    finally:
+        session.close()
 
 
 @app.get('/api/cases/{case_id}/income')
@@ -1940,7 +3491,10 @@ def get_income(case_id: int):
                    'source_name': getattr(ie, 'source_name', ''),
                    'gross_amount': float(getattr(ie, 'gross_amount', 0) or 0),
                    'exempt_amount': float(getattr(ie, 'exempt_amount', 0) or 0),
+                   'amount_in_return': float(getattr(ie, 'amount_in_return', 0) or 0),
                    'tds_amount': float(getattr(ie, 'tds_amount', 0) or 0),
+                   'evidence_code': getattr(ie, 'evidence_code', None),
+                   'notes': getattr(ie, 'notes', None),
                })
         
        return {'ok': True, 'case_id': case_id, 'income_entries': incomes}
@@ -1966,9 +3520,12 @@ def add_income(case_id: int, entry: IncomeEntry):
            ie = IncomeModel(
                case_id=case_id,
                income_type=entry.income_type,
-               source_name=entry.income_type,
+               source_name=(entry.source_name or entry.income_type),
                gross_amount=entry.amount,
                tds_amount=entry.tds_deducted,
+               amount_in_return=entry.amount_in_return if entry.amount_in_return is not None else entry.amount,
+               evidence_code=entry.evidence_code,
+               notes=entry.notes,
            )
            session.add(ie)
            session.commit()
@@ -2183,10 +3740,64 @@ def get_form_summary_report(case_id: int):
        # Aggregate data
        gross_income = 0
        tds_total = 0
+       income_return_total = 0
        if hasattr(case, 'income_entries'):
            for ie in case.income_entries:
                gross_income += float(getattr(ie, 'gross_amount', 0) or 0)
                tds_total += float(getattr(ie, 'tds_amount', 0) or 0)
+               income_return_total += float(getattr(ie, 'amount_in_return', 0) or 0)
+
+       tax_credits = session.scalars(select(TaxCredit).where(TaxCredit.case_id == case_id)).all()
+       tds_26as_total: Optional[float] = None
+       tds_26as_source = "not_available"
+       if tax_credits:
+           tds_26as_total = sum(float(getattr(c, 'tax_amount_26as', 0) or 0) for c in tax_credits)
+           tds_26as_source = "tax_credits_table"
+       else:
+           # Fallback: derive total TDS from uploaded Form 26AS documents if tax-credits table is not filled yet.
+           try:
+               docs = session.scalars(
+                   select(DocumentRequirement).where(DocumentRequirement.case_id == case_id)
+               ).all()
+               target_docs = [d for d in docs if _doc_type_for_code(getattr(d, "code", "")) == "FORM_26AS"]
+               evidence_map = _load_evidences_for_requirements(session, [d.id for d in target_docs]) if target_docs else {}
+               parsed_totals: List[float] = []
+               if target_docs:
+                   from backend.app.document_parser import DocumentParserFactory, DocumentType
+                   for doc in target_docs:
+                       evidences = evidence_map.get(doc.id) or []
+                       if not evidences:
+                           continue
+                       file_path = evidences[0].file_path
+                       if not file_path:
+                           continue
+                       parsed = DocumentParserFactory.parse_document(file_path, DocumentType.FORM_26AS)
+                       if parsed.success:
+                           total_tds = float((parsed.extracted_data or {}).get("total_tds") or 0)
+                           if total_tds > 0:
+                               parsed_totals.append(total_tds)
+               if parsed_totals:
+                   tds_26as_total = sum(parsed_totals)
+                   tds_26as_source = "parsed_form26as_document"
+           except Exception:
+               # keep not_available; we surface this explicitly in verification details
+               pass
+
+       tds_claimed_total = sum(float(getattr(c, 'tax_claimed', 0) or 0) for c in tax_credits) if tax_credits else tds_total
+
+       income_variance = gross_income - income_return_total
+       tds_variance = None if tds_26as_total is None else (tds_26as_total - tds_claimed_total)
+
+       def _variance_status(delta: float) -> str:
+           abs_delta = abs(delta)
+           if abs_delta <= 1:
+               return "matched"
+           if abs_delta <= 100:
+               return "minor_variance"
+           return "variance"
+
+       income_status = _variance_status(income_variance)
+       tds_status = "missing_reference" if tds_variance is None else _variance_status(tds_variance)
         
        filing_result = calculate_filing(tp)
        tax_liability = float(filing_result.get('tax_liability', 0)) if isinstance(filing_result, dict) else 0
@@ -2219,6 +3830,8 @@ def get_form_summary_report(case_id: int):
                'tds_by_bank': 0,
                'tds_by_others': 0,
                'total_tds': tds_total,
+               'total_tds_26as': tds_26as_total,
+               'total_tds_claimed': tds_claimed_total,
            },
             
            'tax_computation': {
@@ -2233,10 +3846,49 @@ def get_form_summary_report(case_id: int):
            },
             
            'verification': {
-               'income_matched': abs(gross_income) < 100,
-               'tds_matched': abs(tds_total) < 100,
+               'income_matched': income_status == 'matched',
+               'tds_matched': tds_status == 'matched',
                'calculations_verified': True,
-               'ready_to_file': abs(gross_income) < 100 and abs(tds_total) < 100,
+               'ready_to_file': income_status in {'matched', 'minor_variance'} and tds_status in {'matched', 'minor_variance'},
+           },
+           'verification_details': {
+               'income': {
+                   'source_total': gross_income,
+                   'itr_total': income_return_total,
+                   'variance': income_variance,
+                   'status': income_status,
+                   'recommended_action': (
+                       'No action needed'
+                       if income_status == 'matched'
+                       else 'Review income lines and align ITR amount with source docs'
+                   ),
+                   'action_steps': [
+                       'Open Income page and compare each source row with document-backed gross amount.',
+                       'If exempt income exists (e.g., NRE interest), move amount to exempt instead of taxable return amount.',
+                       'If difference is rounding only (<= ₹100), keep note in reconciliation and proceed.',
+                   ],
+               },
+               'tds': {
+                   'as_per_26as': tds_26as_total,
+                   'as_per_26as_source': tds_26as_source,
+                   'claimed_in_case': tds_claimed_total,
+                   'variance': tds_variance,
+                   'status': tds_status,
+                   'recommended_action': (
+                       'No action needed'
+                       if tds_status == 'matched'
+                       else (
+                           'Tax Credits is empty. Add/import deductor-wise 26AS credits in Tax Credits page.'
+                           if tds_status == 'missing_reference'
+                           else 'Reconcile deductor-wise TDS with Form 26AS before filing'
+                       )
+                   ),
+                   'action_steps': [
+                       'Open Tax Credits and compare deductor TAN-wise values with Form 26AS.',
+                       'Update claimed TDS to match valid 26AS credits; do not over-claim.',
+                       'If 26AS has not refreshed yet, keep evidence and re-check later before final submission.',
+                   ],
+               },
            },
              
            'filing_instructions': [
@@ -2610,3 +4262,499 @@ try:
     app.include_router(portal_router)
 except Exception as e:
     logger.warning(f"Portal integration endpoints not available: {e}")
+
+
+# ============================================================================
+# FAMILY MEMBERS ENDPOINTS
+# ============================================================================
+
+def _oci_scheme_eligibility(citizenship: str, residential_status: str) -> dict:
+    """Legacy wrapper — kept for backward compat; real logic is in run_scheme_eligibility_engine."""
+    is_oci = (residential_status or '').upper() in ('OCI', 'OCI CARD HOLDER')
+    is_foreign_citizen = citizenship and citizenship.strip().lower() not in ('india', 'indian')
+    return {'is_oci': is_oci, 'is_foreign_citizen': is_foreign_citizen, 'eligible': [], 'ineligible': [], 'notes': []}
+
+
+# ============================================================================
+# SCHEME ELIGIBILITY ENGINE
+# ============================================================================
+
+from datetime import date as _date
+import math as _math
+
+SCHEME_DB = [
+    # --- GIRL CHILD / DAUGHTER ---
+    {
+        'id': 'SSY', 'name': 'Sukanya Samriddhi Yojana (SSY)',
+        'category': 'Savings / Girl Child',
+        'description': 'High-interest government savings scheme for girl child, tax-free under 80C.',
+        'benefit': 'Interest rate ~8.2% p.a., tax-free, up to ₹1.5L/yr deposit. 80C deduction for depositor.',
+        'how_to_apply': "Post office or authorised bank. Account in girl's name, operated by parent.",
+        'criteria': {'gender': 'female', 'max_age': 10, 'citizenship_required': True, 'oci_eligible': False},
+        'authority': 'Ministry of Finance / India Post',
+    },
+    {
+        'id': 'BBBP', 'name': 'Beti Bachao Beti Padhao (BBBP)',
+        'category': 'Girl Child / Welfare',
+        'description': 'National programme for girl child welfare, education and protection.',
+        'benefit': 'Awareness, conditional cash transfers in some states, education support.',
+        'how_to_apply': 'Through Anganwadi, district Women and Child Development office.',
+        'criteria': {'gender': 'female', 'citizenship_required': True, 'oci_eligible': False},
+        'authority': 'Ministry of Women & Child Development',
+    },
+    {
+        'id': 'CBSE_MERIT', 'name': 'CBSE Merit Scholarship for Single Girl Child',
+        'category': 'Scholarship / Education',
+        'description': 'Scholarship for single girl child who passed Class X from CBSE with 60%+ marks.',
+        'benefit': '₹500/month for Class XI-XII continuation.',
+        'how_to_apply': 'Apply on CBSE scholarship portal after Class X results.',
+        'criteria': {'gender': 'female', 'citizenship_required': True, 'oci_eligible': False, 'min_age': 15, 'max_age': 20},
+        'authority': 'CBSE',
+    },
+    {
+        'id': 'NSP_POST_MATRIC', 'name': 'National Scholarship Portal — Post-Matric',
+        'category': 'Scholarship / Education',
+        'description': 'Central government scholarship for students after Class X from minority/SC/ST/OBC/general categories.',
+        'benefit': 'Up to ₹12,000/yr tuition + maintenance allowance.',
+        'how_to_apply': 'scholarships.gov.in',
+        'criteria': {'citizenship_required': True, 'oci_eligible': False, 'min_age': 15, 'max_age': 30},
+        'authority': 'Ministry of Education / NSP',
+    },
+    {
+        'id': 'AICTE_PG', 'name': 'AICTE PG Scholarship',
+        'category': 'Scholarship / Education',
+        'description': 'Scholarship for GATE/GPAT qualified students in AICTE-approved colleges.',
+        'benefit': '₹12,400/month for M.Tech/M.Pharm students.',
+        'how_to_apply': 'Through institution after GATE/GPAT qualification.',
+        'criteria': {'citizenship_required': True, 'oci_eligible': False, 'min_age': 20, 'max_age': 35},
+        'authority': 'AICTE',
+    },
+    # --- OCI / NRI ELIGIBLE ---
+    {
+        'id': 'OCI_ADMISSION', 'name': 'NRI/OCI Quota Admission — IITs, NITs, AIIMS, Central Universities',
+        'category': 'Education / Admission',
+        'description': 'Reserved NRI/OCI seats in premier institutions via JEE/NEET/university entrance.',
+        'benefit': 'Access to IIT, NIT, AIIMS, IIM, BITS, and other top colleges under NRI/OCI quota.',
+        'how_to_apply': 'Apply during regular JEE/NEET cycle — select NRI/OCI category.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True, 'min_age': 16, 'max_age': 25},
+        'authority': 'JoSAA / MCC / respective institutions',
+    },
+    {
+        'id': 'OCI_PVTSCHOOL', 'name': 'School Admission — Treated at par with Indian nationals',
+        'category': 'Education / Admission',
+        'description': 'OCI children can be admitted to private schools on the same terms as Indian students (no PIO/NRI premium).',
+        'benefit': 'Access to CBSE/ICSE/IB private schools at domestic fee rates.',
+        'how_to_apply': 'Directly at school with OCI card + documents.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True, 'max_age': 18},
+        'authority': 'Ministry of Education notification',
+    },
+    {
+        'id': 'AIF_SCHOLARSHIP', 'name': 'American India Foundation (AIF) Fellowship / Scholarships',
+        'category': 'Private Scholarship',
+        'description': 'US-based non-profit offering fellowships and scholarships for Indian-origin students.',
+        'benefit': 'Varies — project-based fellowships, education grants.',
+        'how_to_apply': 'aif.org — open to Indian-origin students globally.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True},
+        'authority': 'American India Foundation (private)',
+    },
+    {
+        'id': 'AKF_SCHOLARSHIP', 'name': 'Aga Khan Foundation International Scholarship',
+        'category': 'Private Scholarship',
+        'description': 'Merit + need-based scholarship for students from developing countries pursuing postgrad.',
+        'benefit': "Covers tuition + living expenses for master's programmes.",
+        'how_to_apply': 'akdn.org/akf — annual application cycle.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True, 'min_age': 18, 'max_age': 30},
+        'authority': 'Aga Khan Foundation (private)',
+    },
+    {
+        'id': 'OCI_STUDY_NOVISA', 'name': 'Right to Study/Live in India without Visa (OCI)',
+        'category': 'OCI Rights',
+        'description': 'OCI card holders can reside, study and work in India indefinitely without requiring a visa or residency permit.',
+        'benefit': 'Lifelong multiple-entry visa equivalent. Parity with Indian nationals for most purposes except election voting, govt jobs.',
+        'how_to_apply': 'OCI card obtained from Indian mission abroad.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True},
+        'authority': 'Ministry of Home Affairs',
+    },
+    {
+        'id': 'OCI_PROPERTY', 'name': 'OCI — Right to acquire immovable property in India',
+        'category': 'OCI Rights',
+        'description': 'OCI holders can buy residential and commercial property in India (not agricultural land).',
+        'benefit': 'Can own property in own name. No RBI permission needed.',
+        'how_to_apply': 'Direct purchase through registered sale deed.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True, 'min_age': 18},
+        'authority': 'FEMA / Ministry of Home Affairs',
+    },
+    {
+        'id': 'NRO_ACCOUNT', 'name': 'NRO Savings / FD Account',
+        'category': 'Banking',
+        'description': 'Non-Resident Ordinary account to receive and manage India-sourced income (rent, dividends, etc.).',
+        'benefit': 'Earn interest on India funds. Interest taxable in India — TDS at 30%.',
+        'how_to_apply': 'Any Indian bank with FEMA KYC documents.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True, 'min_age': 18},
+        'authority': 'RBI / FEMA',
+    },
+    # --- EDUCATION LOAN TAX ---
+    {
+        'id': 'SEC80E_PARENT', 'name': 'Section 80E — Education Loan Interest Deduction (for Parent)',
+        'category': 'Tax Benefit',
+        'description': 'Parent paying education loan EMI for child (incl. OCI child) can deduct interest from taxable income.',
+        'benefit': 'Full interest deduction (no cap) for up to 8 years from start of repayment.',
+        'how_to_apply': 'Loan from bank/approved institution. Claim in ITR of the parent paying the EMI.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True, 'relationship': ['daughter', 'son']},
+        'authority': 'Income Tax Act Section 80E',
+    },
+    # --- HEALTH ---
+    {
+        'id': 'PMJAY', 'name': 'PM Jan Arogya Yojana / Ayushman Bharat',
+        'category': 'Health Insurance',
+        'description': 'Government health insurance scheme providing ₹5L/year hospital coverage.',
+        'benefit': '₹5 lakh per year free hospitalisation at empanelled hospitals.',
+        'how_to_apply': 'pmjay.gov.in — based on SECC data or Ration Card/BPL list.',
+        'criteria': {'citizenship_required': True, 'oci_eligible': False},
+        'authority': 'National Health Authority',
+    },
+    {
+        'id': 'SEC80D_PARENT', 'name': 'Section 80D — Health Insurance Premium Deduction (for Parent)',
+        'category': 'Tax Benefit',
+        'description': 'Parent paying health insurance premium for child can claim deduction even if child is OCI/NRI.',
+        'benefit': '₹25,000 deduction per year (₹50,000 if parent is senior citizen).',
+        'how_to_apply': 'Buy health insurance policy. Claim in ITR.',
+        'criteria': {'citizenship_required': False, 'oci_eligible': True},
+        'authority': 'Income Tax Act Section 80D',
+    },
+    # --- STATE-SPECIFIC (Gujarat) ---
+    {
+        'id': 'GJ_VIDYADEEP', 'name': 'Gujarat — Vidyadeep Yojana (State Scholarship)',
+        'category': 'State Scholarship',
+        'description': 'Gujarat state scholarship for meritorious students from economically weaker sections.',
+        'benefit': 'Varies by category — tuition + stipend.',
+        'how_to_apply': 'sje.gujarat.gov.in',
+        'criteria': {'citizenship_required': True, 'oci_eligible': False, 'state': 'Gujarat'},
+        'authority': 'Govt of Gujarat — Social Justice Dept',
+    },
+    {
+        'id': 'GJ_KANYA_KELAVANI', 'name': 'Gujarat — Kanya Kelavani Nidhi',
+        'category': 'State / Girl Child',
+        'description': 'Gujarat scheme promoting girl child education.',
+        'benefit': 'Conditional cash transfers to families enrolling daughters in school.',
+        'how_to_apply': 'District primary education office.',
+        'criteria': {'gender': 'female', 'citizenship_required': True, 'oci_eligible': False, 'max_age': 14},
+        'authority': 'Govt of Gujarat — Education Dept',
+    },
+]
+
+
+def run_scheme_eligibility_engine(profile: dict) -> dict:
+    """
+    Evaluate all schemes in SCHEME_DB against the family member profile.
+    Returns categorised results: eligible, ineligible, partial, unknown.
+    """
+    citizenship = (profile.get('citizenship') or '').strip().lower()
+    residential_status = (profile.get('residential_status') or '').strip().lower()
+    relationship = (profile.get('relationship') or '').strip().lower()
+    gender_guess = 'female' if relationship in ('daughter', 'mother', 'sister', 'mother-in-law') else (
+        'male' if relationship in ('son', 'father', 'brother', 'father-in-law') else None)
+    living_in_india = profile.get('living_in_india', True)
+    currently_studying = profile.get('currently_studying', False)
+    has_india_income = profile.get('has_india_income', False)
+
+    is_indian_citizen = citizenship in ('india', 'indian', '')
+    is_oci = 'oci' in residential_status
+    is_nri = 'nri' in residential_status
+    is_foreign_citizen = not is_indian_citizen
+
+    # Calculate age
+    dob = profile.get('date_of_birth')
+    age = None
+    if dob:
+        try:
+            dob_date = _date.fromisoformat(str(dob))
+            today = _date.today()
+            age = today.year - dob_date.year - ((today.month, today.day) < (dob_date.month, dob_date.day))
+        except Exception:
+            age = None
+
+    eligible = []
+    ineligible = []
+    partial = []
+
+    for scheme in SCHEME_DB:
+        c = scheme['criteria']
+        reasons_no = []
+        reasons_partial = []
+
+        # Citizenship check
+        if c.get('citizenship_required') and is_foreign_citizen:
+            if not (is_oci and c.get('oci_eligible')):
+                reasons_no.append('Requires Indian citizenship — OCI/foreign national not eligible')
+
+        # OCI specifically eligible
+        if c.get('oci_eligible') is False and is_oci:
+            reasons_no.append('OCI card holders explicitly excluded')
+
+        # Gender check
+        if c.get('gender') and gender_guess and c['gender'] != gender_guess:
+            reasons_no.append(f"For {c['gender']}s only")
+
+        # Age check
+        if age is not None:
+            if c.get('min_age') and age < c['min_age']:
+                reasons_no.append(f"Minimum age {c['min_age']} (currently {age})")
+            if c.get('max_age') and age > c['max_age']:
+                reasons_no.append(f"Maximum age {c['max_age']} (currently {age})")
+        else:
+            if c.get('max_age') or c.get('min_age'):
+                reasons_partial.append('Age not provided — cannot confirm age eligibility')
+
+        # Relationship check (e.g. 80E needs to be child)
+        if c.get('relationship'):
+            if relationship not in [r.lower() for r in c['relationship']]:
+                reasons_no.append(f"Applies to {', '.join(c['relationship'])} relationship only")
+
+        entry = {
+            'id': scheme['id'],
+            'name': scheme['name'],
+            'category': scheme['category'],
+            'description': scheme['description'],
+            'benefit': scheme['benefit'],
+            'how_to_apply': scheme['how_to_apply'],
+            'authority': scheme['authority'],
+        }
+
+        if reasons_no:
+            entry['reasons'] = reasons_no
+            ineligible.append(entry)
+        elif reasons_partial:
+            entry['reasons'] = reasons_partial
+            partial.append(entry)
+        else:
+            eligible.append(entry)
+
+    # Categorise eligible schemes
+    categories = {}
+    for s in eligible:
+        categories.setdefault(s['category'], []).append(s)
+
+    return {
+        'eligible': eligible,
+        'ineligible': ineligible,
+        'partial': partial,
+        'categories': list(categories.keys()),
+        'summary': {
+            'total_schemes_checked': len(SCHEME_DB),
+            'eligible_count': len(eligible),
+            'ineligible_count': len(ineligible),
+            'needs_info_count': len(partial),
+        },
+        'profile_used': {
+            'citizenship': profile.get('citizenship'),
+            'residential_status': profile.get('residential_status'),
+            'age': age,
+            'gender_inferred': gender_guess,
+            'is_oci': is_oci,
+            'is_indian_citizen': is_indian_citizen,
+        }
+    }
+
+
+def _tax_relevance_notes(relationship: str, citizenship: str, residential_status: str, has_india_income: bool) -> list:
+    """Generate tax relevance notes for the family member."""
+    notes = []
+    rel = (relationship or '').lower()
+    is_oci = (residential_status or '').upper() in ('OCI', 'OCI CARD HOLDER')
+    is_foreign = citizenship and citizenship.strip().lower() not in ('india', 'indian')
+
+    if rel == 'daughter' and is_oci:
+        notes.append("Clubbing provisions (Sec 64): If minor daughter earns income, it clubs with parent's income. If she is 18+, income is independently taxable only if India-sourced.")
+        notes.append("Education loan (Sec 80E): Nilesh/Avani can claim 80E deduction for interest on education loan taken for her studies — applies even for OCI child.")
+        notes.append("No HUF inclusion: OCI card holders are NOT members of Hindu Undivided Family for tax purposes.")
+    if has_india_income:
+        notes.append("India-sourced income (rent, interest, salary) is taxable in India even for OCI/foreign citizens — ITR filing may be required if income exceeds basic exemption.")
+        notes.append("TDS may be deducted on India income; Form 26AS should be linked to her PAN (if any).")
+    if is_oci or is_foreign:
+        notes.append("DTAA (India-US treaty): If she becomes a US tax resident in future, DTAA provisions will apply to avoid double taxation on India income.")
+
+    return notes
+
+
+@app.get('/api/family-members')
+def get_family_members():
+    if engine is None:
+        return {'ok': False, 'error': 'Database not connected'}
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT * FROM family_members ORDER BY id")).mappings().all()
+            members = [dict(r) for r in rows]
+            for m in members:
+                if m.get('date_of_birth'):
+                    m['date_of_birth'] = str(m['date_of_birth'])
+                if m.get('created_at'):
+                    m['created_at'] = str(m['created_at'])
+                if m.get('updated_at'):
+                    m['updated_at'] = str(m['updated_at'])
+            return {'ok': True, 'members': members}
+    except Exception as e:
+        logger.error(f"Error fetching family members: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
+@app.post('/api/family-members')
+async def add_family_member(request: Request):
+    if engine is None:
+        return {'ok': False, 'error': 'Database not connected'}
+    try:
+        data = await request.json()
+        engine_result = run_scheme_eligibility_engine(data)
+        tax_notes = _tax_relevance_notes(
+            data.get('relationship', ''), data.get('citizenship', ''),
+            data.get('residential_status', ''), data.get('has_india_income', False)
+        )
+        with engine.begin() as conn:
+            result = conn.execute(text("""
+                INSERT INTO family_members
+                    (name, relationship, date_of_birth, citizenship, residential_status,
+                     oci_card_last4, pan_last4, living_in_india, currently_studying,
+                     institution_name, course_details, currently_working, employer_country,
+                     has_india_income, india_income_notes, govt_scheme_eligibility,
+                     tax_relevance_notes, notes)
+                VALUES
+                    (:name, :relationship, :dob, :citizenship, :residential_status,
+                     :oci_card_last4, :pan_last4, :living_in_india, :currently_studying,
+                     :institution_name, :course_details, :currently_working, :employer_country,
+                     :has_india_income, :india_income_notes, :govt_scheme_eligibility,
+                     :tax_relevance_notes, :notes)
+                RETURNING id
+            """), {
+                'name': data.get('name', ''),
+                'relationship': data.get('relationship', ''),
+                'dob': data.get('date_of_birth') or None,
+                'citizenship': data.get('citizenship', ''),
+                'residential_status': data.get('residential_status', ''),
+                'oci_card_last4': data.get('oci_card_last4', ''),
+                'pan_last4': data.get('pan_last4', ''),
+                'living_in_india': data.get('living_in_india', True),
+                'currently_studying': data.get('currently_studying', False),
+                'institution_name': data.get('institution_name', ''),
+                'course_details': data.get('course_details', ''),
+                'currently_working': data.get('currently_working', False),
+                'employer_country': data.get('employer_country', ''),
+                'has_india_income': data.get('has_india_income', False),
+                'india_income_notes': data.get('india_income_notes', ''),
+                'govt_scheme_eligibility': f"Engine checked {len(SCHEME_DB)} schemes. Eligible: {engine_result['summary']['eligible_count']}",
+                'tax_relevance_notes': '\n'.join(tax_notes),
+                'notes': data.get('notes', ''),
+            })
+            new_id = result.scalar()
+        return {'ok': True, 'id': new_id, 'engine_result': engine_result, 'tax_notes': tax_notes}
+    except Exception as e:
+        logger.error(f"Error adding family member: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
+
+@app.put('/api/family-members/{member_id}')
+async def update_family_member(member_id: int, request: Request):
+    if engine is None:
+        return {'ok': False, 'error': 'Database not connected'}
+    try:
+        data = await request.json()
+        engine_result = run_scheme_eligibility_engine(data)
+        tax_notes = _tax_relevance_notes(
+            data.get('relationship', ''), data.get('citizenship', ''),
+            data.get('residential_status', ''), data.get('has_india_income', False)
+        )
+        with engine.begin() as conn:
+            conn.execute(text("""
+                UPDATE family_members SET
+                    name = :name, relationship = :relationship, date_of_birth = :dob,
+                    citizenship = :citizenship, residential_status = :residential_status,
+                    oci_card_last4 = :oci_card_last4, pan_last4 = :pan_last4,
+                    living_in_india = :living_in_india, currently_studying = :currently_studying,
+                    institution_name = :institution_name, course_details = :course_details,
+                    currently_working = :currently_working, employer_country = :employer_country,
+                    has_india_income = :has_india_income, india_income_notes = :india_income_notes,
+                    govt_scheme_eligibility = :govt_scheme_eligibility,
+                    tax_relevance_notes = :tax_relevance_notes, notes = :notes,
+                    updated_at = NOW()
+                WHERE id = :id
+            """), {
+                'id': member_id,
+                'name': data.get('name', ''),
+                'relationship': data.get('relationship', ''),
+                'dob': data.get('date_of_birth') or None,
+                'citizenship': data.get('citizenship', ''),
+                'residential_status': data.get('residential_status', ''),
+                'oci_card_last4': data.get('oci_card_last4', ''),
+                'pan_last4': data.get('pan_last4', ''),
+                'living_in_india': data.get('living_in_india', True),
+                'currently_studying': data.get('currently_studying', False),
+                'institution_name': data.get('institution_name', ''),
+                'course_details': data.get('course_details', ''),
+                'currently_working': data.get('currently_working', False),
+                'employer_country': data.get('employer_country', ''),
+                'has_india_income': data.get('has_india_income', False),
+                'india_income_notes': data.get('india_income_notes', ''),
+                'govt_scheme_eligibility': f"Engine checked {len(SCHEME_DB)} schemes. Eligible: {engine_result['summary']['eligible_count']}",
+                'tax_relevance_notes': '\n'.join(tax_notes),
+                'notes': data.get('notes', ''),
+            })
+        return {'ok': True, 'engine_result': engine_result, 'tax_notes': tax_notes}
+    except Exception as e:
+        logger.error(f"Error updating family member: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
+
+@app.delete('/api/family-members/{member_id}')
+def delete_family_member(member_id: int):
+    if engine is None:
+        return {'ok': False, 'error': 'Database not connected'}
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM family_members WHERE id = :id"), {'id': member_id})
+        return {'ok': True}
+    except Exception as e:
+        logger.error(f"Error deleting family member: {e}")
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get('/api/family-members/{member_id}/scheme-check')
+def check_scheme_eligibility(member_id: int):
+    """Run eligibility engine against saved profile of a member."""
+    if engine is None:
+        return {'ok': False, 'error': 'Database not connected'}
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT * FROM family_members WHERE id = :id"), {'id': member_id}).mappings().first()
+            if not row:
+                return {'ok': False, 'error': 'Member not found'}
+        m = dict(row)
+        engine_result = run_scheme_eligibility_engine(m)
+        tax_notes = _tax_relevance_notes(
+            m.get('relationship', ''), m.get('citizenship', ''),
+            m.get('residential_status', ''), m.get('has_india_income', False)
+        )
+        return {'ok': True, 'member': m['name'], 'engine_result': engine_result, 'tax_notes': tax_notes}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+@app.post('/api/scheme-eligibility/check')
+async def check_scheme_eligibility_adhoc(request: Request):
+    """Run eligibility engine on an ad-hoc profile (no DB record needed)."""
+    try:
+        profile = await request.json()
+        engine_result = run_scheme_eligibility_engine(profile)
+        tax_notes = _tax_relevance_notes(
+            profile.get('relationship', ''), profile.get('citizenship', ''),
+            profile.get('residential_status', ''), profile.get('has_india_income', False)
+        )
+        return {'ok': True, 'engine_result': engine_result, 'tax_notes': tax_notes}
+    except Exception as e:
+        return {'ok': False, 'error': str(e)}
+
+
+@app.get('/api/scheme-eligibility/schemes')
+def list_all_schemes():
+    """Return the full scheme database."""
+    return {'ok': True, 'schemes': SCHEME_DB, 'total': len(SCHEME_DB)}

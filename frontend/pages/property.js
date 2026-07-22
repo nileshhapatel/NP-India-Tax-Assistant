@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { Building2, Loader2, AlertCircle, Plus, Pencil, Landmark, Home, Hammer } from 'lucide-react';
+import { Building2, Loader2, AlertCircle, Plus, Pencil, Landmark, Home, Hammer, Sparkles, AlertTriangle, ChevronDown, ChevronRight } from 'lucide-react';
 import useSWR from 'swr';
 import { apiCall, fetcher } from '../lib/api';
 import { useCaseContext } from '../lib/case-context';
@@ -22,7 +22,8 @@ const DEFAULT_FORM = {
   notes: '',
 };
 
-const inr = (v) => `₹${Number(v || 0).toLocaleString('en-IN')}`;
+const inr = (v) => `₹${Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`;
+const fmt2 = (v) => `₹${Number(v || 0).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 
 function PropertyTag({ item }) {
   const underConstruction = !item.possession_date;
@@ -40,6 +41,9 @@ export default function Property() {
   const [showEditor, setShowEditor] = useState(false);
   const [editingId, setEditingId] = useState(null);
   const [message, setMessage] = useState('');
+  const [loanParsed, setLoanParsed] = useState(null);
+  const [parsingLoan, setParsingLoan] = useState(false);
+  const [showLoanPanel, setShowLoanPanel] = useState(false);
 
   const properties = data?.properties || [];
   const totals = useMemo(() => {
@@ -83,7 +87,39 @@ export default function Property() {
     }
   };
 
-  if (isLoading) return <div className="flex items-center justify-center min-h-screen"><Loader2 className="w-8 h-8 animate-spin text-primary-600" /></div>;
+  const parseLoanCert = async () => {
+    setParsingLoan(true);
+    setLoanParsed(null);
+    try {
+      const res = await fetch(apiUrl(`/api/cases/${caseId}/loan-cert/parse`), { method: 'POST' });
+      const payload = await res.json();
+      setLoanParsed(payload);
+      setShowLoanPanel(true);
+    } catch (e) {
+      setLoanParsed({ ok: false, error: e.message });
+      setShowLoanPanel(true);
+    } finally {
+      setParsingLoan(false);
+    }
+  };
+
+  const applyLoanValues = (selfOccupied) => {
+    if (!loanParsed?.extracted) return;
+    const d = loanParsed.extracted;
+    setForm((prev) => ({
+      ...prev,
+      lender: prev.lender || 'HDFC Bank',
+      interest_fy: String(Math.round(d.interest_paid || 0)),
+      principal_fy: String(Math.round(d.principal_paid || 0)),
+      self_occupied: selfOccupied,
+      notes: [prev.notes, `Auto-calculated: Interest ₹${Math.round(d.interest_paid || 0).toLocaleString('en-IN')} | Principal ₹${Math.round(d.principal_paid || 0).toLocaleString('en-IN')} | Loan ${d.loan_account || ''} @ ${d.roi_percent || ''}% (amortization calc)`].filter(Boolean).join('\n'),
+    }));
+    setShowEditor(true);
+    setShowLoanPanel(false);
+    setMessage('Loan values pre-filled in editor below. Confirm property type and save.');
+  };
+
+
   if (error) return <div className="flex items-center gap-2 text-red-600"><AlertCircle className="w-6 h-6" /><span>Error loading property data</span></div>;
 
   return (
@@ -123,11 +159,98 @@ export default function Property() {
       <div className="bg-blue-50 border border-blue-200 rounded-lg p-5">
         <h3 className="font-semibold text-blue-900 mb-2">Tax guidance</h3>
         <div className="text-sm text-blue-900 space-y-1">
-          <p>🏠 Self-occupied property: Interest under Section 24(b) is generally capped (commonly up to ₹2 lakh, subject to conditions).</p>
-          <p>🏢 Let-out property: Interest treatment differs; maintain rent/municipal tax/interest evidence for accurate computation.</p>
-          <p>🏗️ Under-construction interest: track pre-construction interest carefully for phased claim after possession.</p>
+          <p>🏠 Self-occupied property: Section 24(b) interest deduction capped at <strong>₹2,00,000</strong> per year.</p>
+          <p>🏢 Let-out / deemed let-out: <strong>Full interest deductible</strong> under Section 24(b) — no cap. Net loss allowed up to rules.</p>
+          <p>🏗️ Under-construction: Pre-construction interest deductible in 5 equal instalments from year of possession.</p>
+          <p>💰 Section 80C: Principal repayment deductible up to <strong>₹1,50,000</strong> overall cap (shared with LIC, PPF, ELSS, etc.).</p>
         </div>
       </div>
+
+      {/* Loan Certificate Auto-Read Panel */}
+      <div className="bg-white rounded-lg border border-gray-200 p-5">
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <Sparkles className="w-5 h-5 text-primary-600" />
+            <h2 className="text-base font-semibold text-gray-900">Auto-read from Home Loan Certificate</h2>
+          </div>
+          <button
+            onClick={parseLoanCert}
+            disabled={parsingLoan}
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-primary-600 text-white text-sm hover:bg-primary-700 disabled:bg-gray-400"
+          >
+            {parsingLoan ? <><Loader2 className="w-4 h-4 animate-spin" /> Parsing...</> : <><Sparkles className="w-4 h-4" /> Read Loan Certificate</>}
+          </button>
+        </div>
+        <p className="mt-1 text-sm text-gray-600">
+          Calculates interest and principal from the uploaded HDFC loan statement using monthly-rest amortization.
+        </p>
+
+        {showLoanPanel && loanParsed && (
+          <div className="mt-4 space-y-3">
+            {!loanParsed.ok ? (
+              <div className="flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+                <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+                <span>{loanParsed.error || 'Could not parse loan certificate'}</span>
+              </div>
+            ) : (
+              <>
+                {loanParsed.warnings?.length > 0 && (
+                  <div className="flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+                    <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
+                    <span>{loanParsed.warnings[0]}</span>
+                  </div>
+                )}
+
+                {/* Loan details */}
+                <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 text-sm space-y-1">
+                  <p><strong>Account:</strong> {loanParsed.extracted?.loan_account} &nbsp;|&nbsp; <strong>Type:</strong> {loanParsed.extracted?.loan_type}</p>
+                  <p><strong>Loan Amount:</strong> {inr(loanParsed.extracted?.loan_amount)} &nbsp;|&nbsp; <strong>ROI:</strong> {loanParsed.extracted?.roi_percent}% &nbsp;|&nbsp; <strong>EMI:</strong> {inr(loanParsed.extracted?.current_emi)}</p>
+                  <p><strong>EMIs paid this FY:</strong> {loanParsed.extracted?.regular_emi_count} regular + pre-EMI {inr(loanParsed.extracted?.pre_emi_amount)} &nbsp;|&nbsp; <strong>Total paid:</strong> {inr(loanParsed.extracted?.total_paid)}</p>
+                </div>
+
+                {/* Calculated interest/principal */}
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+                  <div className="rounded-lg border border-green-200 bg-green-50 p-3">
+                    <p className="text-green-700 text-xs">Interest paid (FY)</p>
+                    <p className="text-xl font-bold text-green-800">{inr(loanParsed.extracted?.interest_paid)}</p>
+                  </div>
+                  <div className="rounded-lg border border-blue-200 bg-blue-50 p-3">
+                    <p className="text-blue-700 text-xs">Principal repaid (FY)</p>
+                    <p className="text-xl font-bold text-blue-800">{inr(loanParsed.extracted?.principal_paid)}</p>
+                  </div>
+                  <div className="rounded-lg border border-purple-200 bg-purple-50 p-3">
+                    <p className="text-purple-700 text-xs">Sec 24(b) — self-occ</p>
+                    <p className="text-xl font-bold text-purple-800">{inr(loanParsed.deduction_summary?.section_24b_self_occ_limit)} <span className="text-xs font-normal">(cap)</span></p>
+                  </div>
+                  <div className="rounded-lg border border-orange-200 bg-orange-50 p-3">
+                    <p className="text-orange-700 text-xs">Sec 80C principal</p>
+                    <p className="text-xl font-bold text-orange-800">{inr(loanParsed.deduction_summary?.section_80c_principal_limit)} <span className="text-xs font-normal">(cap)</span></p>
+                  </div>
+                </div>
+
+                <p className="text-xs text-gray-600">{loanParsed.deduction_summary?.note}</p>
+
+                {/* Apply buttons */}
+                <div className="flex flex-wrap gap-3 pt-1">
+                  <button
+                    onClick={() => applyLoanValues(true)}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-blue-600 text-white text-sm hover:bg-blue-700"
+                  >
+                    🏠 Apply as Self-occupied (₹2L interest cap)
+                  </button>
+                  <button
+                    onClick={() => applyLoanValues(false)}
+                    className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-purple-600 text-white text-sm hover:bg-purple-700"
+                  >
+                    🏢 Apply as Let-out (full interest)
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </div>
+
 
       {showEditor && (
         <div className="bg-white rounded-lg border border-gray-200 p-6 space-y-4">

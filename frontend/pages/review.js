@@ -31,9 +31,61 @@ export default function Review() {
   const calcReport = calcData?.report || {};
   const formReport = formData?.report || {};
   const itrRecommendation = itrData?.recommendation || null;
+  const verificationDetails = formReport.verification_details || {};
+  const fmt = (v) => `₹${Number(v || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+  const fmtMaybe = (v) => (v === null || v === undefined ? '—' : fmt(v));
 
   const handleExportPDF = () => {
-    alert('PDF export functionality coming soon. For now, use browser print to PDF.');
+    const title = `ITR Review Report - Case ${selectedCase}`;
+    const generatedAt = new Date().toLocaleString();
+    const html = `
+      <html>
+        <head>
+          <title>${title}</title>
+          <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; padding: 24px; color: #111827; }
+            h1 { font-size: 24px; margin-bottom: 6px; }
+            h2 { font-size: 18px; margin-top: 24px; margin-bottom: 8px; }
+            .muted { color: #6b7280; font-size: 12px; }
+            .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+            .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 12px; }
+            table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+            th, td { border: 1px solid #e5e7eb; padding: 8px; font-size: 13px; text-align: left; }
+          </style>
+        </head>
+        <body>
+          <h1>${title}</h1>
+          <div class="muted">Generated: ${generatedAt}</div>
+          <div class="muted">Taxpayer: ${formReport.taxpayer_details?.name || "-"} | AY: ${formReport.assessment_year || "-"} | FY: ${formReport.financial_year || "-"}</div>
+
+          <h2>Verification Summary</h2>
+          <div class="grid">
+            <div class="card"><strong>Income Check</strong><div>${formReport.verification?.income_matched ? "Matched" : "Variance detected"}</div><div class="muted">Source ${fmt(verificationDetails?.income?.source_total)} vs ITR ${fmt(verificationDetails?.income?.itr_total)}</div></div>
+            <div class="card"><strong>TDS Check</strong><div>${formReport.verification?.tds_matched ? "Matched" : "Variance detected"}</div><div class="muted">26AS ${fmt(verificationDetails?.tds?.as_per_26as)} vs Claimed ${fmt(verificationDetails?.tds?.claimed_in_case)}</div></div>
+          </div>
+
+          <h2>Income & Tax Snapshot</h2>
+          <table>
+            <tr><th>Total Income</th><td>${fmt(formReport.schedule_sa_income?.total_income || 0)}</td></tr>
+            <tr><th>Total TDS</th><td>${fmt(formReport.schedule_tds?.total_tds || 0)}</td></tr>
+            <tr><th>Tax Payable</th><td>${fmt(formReport.tax_computation?.tax_payable || 0)}</td></tr>
+            <tr><th>Refund</th><td>${fmt(formReport.tax_computation?.refund || 0)}</td></tr>
+          </table>
+
+          <h2>Filing Instructions</h2>
+          <ul>
+            ${(formReport.filing_instructions || []).map((x) => `<li>${x}</li>`).join("")}
+          </ul>
+        </body>
+      </html>
+    `;
+    const popup = window.open('', '_blank');
+    if (!popup) return;
+    popup.document.open();
+    popup.document.write(html);
+    popup.document.close();
+    popup.focus();
+    popup.print();
   };
 
   const handleExportJSON = () => {
@@ -302,6 +354,17 @@ export default function Review() {
                 <div>
                   <p className="font-medium text-gray-900">Income Verification</p>
                   <p className="text-sm text-gray-600">{formReport.verification?.income_matched ? '✅ Income matches across all records' : '⚠️ Income variance detected'}</p>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Source {fmt(verificationDetails?.income?.source_total)} vs ITR {fmt(verificationDetails?.income?.itr_total)} • Variance {fmt(verificationDetails?.income?.variance)}
+                  </p>
+                  <p className="text-xs text-gray-700 mt-1"><strong>Action:</strong> {verificationDetails?.income?.recommended_action || 'Review Income page.'}</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <a href="/income" className="text-xs px-2 py-1 rounded border border-blue-200 bg-blue-50 text-blue-700">Resolve in Income</a>
+                    <a href="/reconciliation" className="text-xs px-2 py-1 rounded border border-gray-200 bg-gray-50 text-gray-700">Open Reconciliation</a>
+                    {!formReport.verification?.income_matched && Math.abs(Number(verificationDetails?.income?.variance || 0)) <= 100 ? (
+                      <span className="text-xs px-2 py-1 rounded border border-green-200 bg-green-50 text-green-700">Minor variance: approve with note</span>
+                    ) : null}
+                  </div>
                 </div>
               </div>
 
@@ -314,6 +377,20 @@ export default function Review() {
                 <div>
                   <p className="font-medium text-gray-900">TDS Verification</p>
                   <p className="text-sm text-gray-600">{formReport.verification?.tds_matched ? '✅ TDS matched with Form 26AS' : '⚠️ TDS variance detected'}</p>
+                  <p className="text-xs text-gray-600 mt-1">
+                    Form 26AS {fmtMaybe(verificationDetails?.tds?.as_per_26as)} vs Claimed {fmtMaybe(verificationDetails?.tds?.claimed_in_case)} • Variance {fmtMaybe(verificationDetails?.tds?.variance)}
+                  </p>
+                  <p className="text-xs text-gray-500 mt-1">
+                    Reference source: {verificationDetails?.tds?.as_per_26as_source || 'not_available'}
+                  </p>
+                  <p className="text-xs text-gray-700 mt-1"><strong>Action:</strong> {verificationDetails?.tds?.recommended_action || 'Review Tax Credits page.'}</p>
+                  <div className="mt-2 flex flex-wrap gap-2">
+                    <a href="/tax-credits" className="text-xs px-2 py-1 rounded border border-blue-200 bg-blue-50 text-blue-700">Resolve in Tax Credits</a>
+                    <a href="/reconciliation" className="text-xs px-2 py-1 rounded border border-gray-200 bg-gray-50 text-gray-700">Open Reconciliation</a>
+                    {!formReport.verification?.tds_matched && Math.abs(Number(verificationDetails?.tds?.variance || 0)) <= 100 ? (
+                      <span className="text-xs px-2 py-1 rounded border border-green-200 bg-green-50 text-green-700">Minor variance: approve with note</span>
+                    ) : null}
+                  </div>
                 </div>
               </div>
 

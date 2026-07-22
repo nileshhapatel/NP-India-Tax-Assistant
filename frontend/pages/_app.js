@@ -1,6 +1,6 @@
 import '../styles/globals.css';
 import Link from 'next/link';
-import { FileText, Users, BarChart3, FileUp, CheckCircle, Download, History, MessageSquare, ListTodo, Building2, Bot } from 'lucide-react';
+import { FileText, Users, BarChart3, FileUp, CheckCircle, Download, History, MessageSquare, ListTodo, Building2, Bot, Heart } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { CaseProvider, useCaseContext } from '../lib/case-context';
 
@@ -13,6 +13,7 @@ const NAVIGATION = [
   { name: 'Income', href: '/income', icon: BarChart3 },
   { name: 'Tax Credits', href: '/tax-credits', icon: CheckCircle },
   { name: 'Property', href: '/property', icon: Building2 },
+  { name: 'Family', href: '/family', icon: Heart },
   { name: 'Tasks', href: '/tasks', icon: ListTodo },
   { name: 'History', href: '/history', icon: History },
   { name: 'Reconciliation', href: '/reconciliation', icon: CheckCircle },
