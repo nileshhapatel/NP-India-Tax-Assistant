@@ -119,6 +119,27 @@ class DocumentRequirement(Base, TimestampMixin):
     notes: Mapped[Optional[str]] = mapped_column(Text)
 
     case: Mapped["TaxCase"] = relationship(back_populates="documents")
+    evidences: Mapped[list["DocumentEvidence"]] = relationship(
+        back_populates="document_requirement",
+        cascade="all, delete-orphan",
+        foreign_keys="DocumentEvidence.document_requirement_id",
+    )
+
+
+class DocumentEvidence(Base, TimestampMixin):
+    __tablename__ = "document_evidences"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    document_requirement_id: Mapped[int] = mapped_column(ForeignKey("document_requirements.id"))
+    title: Mapped[Optional[str]] = mapped_column(String(240))
+    file_path: Mapped[str] = mapped_column(Text)
+    is_primary: Mapped[bool] = mapped_column(Boolean, default=False)
+    source_document_requirement_id: Mapped[Optional[int]] = mapped_column(ForeignKey("document_requirements.id"))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    document_requirement: Mapped["DocumentRequirement"] = relationship(
+        back_populates="evidences", foreign_keys=[document_requirement_id]
+    )
 
 
 class Task(Base, TimestampMixin):

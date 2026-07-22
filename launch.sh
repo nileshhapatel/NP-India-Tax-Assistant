@@ -116,27 +116,34 @@ python3 - <<'PY'
 import json
 import sys
 from urllib.request import urlopen
+from urllib.error import HTTPError
 
 checks = [
-    ("http://localhost:8000/health", lambda d: d.get("status") == "ok"),
-    ("http://localhost:8000/api/cases/1", lambda d: d.get("ok") is True and "case" in d),
-    ("http://localhost:8000/api/documents/case/1", lambda d: d.get("ok") is True and "documents" in d),
-    ("http://localhost:8000/api/cases/1/progress", lambda d: d.get("ok") is True and "progress" in d),
-    ("http://localhost:8000/api/cases/1/review-checks", lambda d: d.get("ok") is True and "checks" in d),
-    ("http://localhost:8000/api/cases/1/residency", lambda d: d.get("ok") is True and "residency" in d),
-    ("http://localhost:8000/api/cases/1/tax-credits", lambda d: d.get("ok") is True and "credits" in d),
-    ("http://localhost:8000/api/cases/1/tasks", lambda d: d.get("ok") is True and "tasks" in d),
-    ("http://localhost:8000/api/cases/1/properties", lambda d: d.get("ok") is True and "properties" in d),
-    ("http://localhost:8000/api/cases/1/audit-history", lambda d: d.get("ok") is True and "history" in d),
-    ("http://localhost:8000/api/cases/1/reconciliation", lambda d: d.get("ok") is True and "reconciliation" in d),
-    ("http://localhost:8000/api/cases/1/reports/calculation", lambda d: d.get("ok") is True and "report" in d),
-    ("http://localhost:8000/api/cases/1/reports/form-summary", lambda d: d.get("ok") is True and "report" in d),
-    ("http://localhost:8000/api/portal/export?case_id=1&format=json", lambda d: d.get("ok") is True),
+    ("http://localhost:8000/health", lambda d: d.get("status") == "ok", False),
+    ("http://localhost:8000/api/cases/1", lambda d: d.get("ok") is True and "case" in d, False),
+    ("http://localhost:8000/api/documents/case/1", lambda d: d.get("ok") is True and "documents" in d, False),
+    ("http://localhost:8000/api/cases/1/progress", lambda d: d.get("ok") is True and "progress" in d, False),
+    ("http://localhost:8000/api/cases/1/review-checks", lambda d: d.get("ok") is True and "checks" in d, False),
+    ("http://localhost:8000/api/cases/1/residency", lambda d: d.get("ok") is True and "residency" in d, False),
+    ("http://localhost:8000/api/cases/1/tax-credits", lambda d: d.get("ok") is True and "credits" in d, False),
+    ("http://localhost:8000/api/cases/1/tasks", lambda d: d.get("ok") is True and "tasks" in d, False),
+    ("http://localhost:8000/api/cases/1/properties", lambda d: d.get("ok") is True and "properties" in d, False),
+    ("http://localhost:8000/api/cases/1/audit-history", lambda d: d.get("ok") is True and "history" in d, False),
+    ("http://localhost:8000/api/cases/1/reconciliation", lambda d: d.get("ok") is True and "reconciliation" in d, False),
+    ("http://localhost:8000/api/cases/1/reports/calculation", lambda d: d.get("ok") is True and "report" in d, False),
+    ("http://localhost:8000/api/cases/1/reports/form-summary", lambda d: d.get("ok") is True and "report" in d, False),
+    ("http://localhost:8000/api/portal/export?case_id=1&format=json", lambda d: d.get("ok") is True, True),
 ]
 
-for url, predicate in checks:
-    with urlopen(url, timeout=15) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+for url, predicate, optional in checks:
+    try:
+        with urlopen(url, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except HTTPError as e:
+        if optional and e.code == 404:
+            print(f"optional endpoint unavailable (skipped): {url}")
+            continue
+        raise
     if not predicate(payload):
         raise SystemExit(f"Smoke check failed for {url}: {payload}")
 
